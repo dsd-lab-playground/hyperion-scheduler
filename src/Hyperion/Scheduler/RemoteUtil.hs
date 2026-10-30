@@ -12,21 +12,30 @@
 module Hyperion.Scheduler.RemoteUtil where
 
 
-import Control.Concurrent                  (myThreadId)
+import Control.Concurrent                  (forkIO, myThreadId)
+import Control.Concurrent.MVar             (newEmptyMVar, putMVar, readMVar,
+                                            takeMVar, tryTakeMVar)
 import Control.Distributed.Process         (Closure, NodeId, Process, ProcessId,
-                                            SendPort, newChan, receiveChan,
+                                            ProcessMonitorNotification (..),
+                                            SendPort, matchIf, monitor, newChan,
+                                            receiveChan, receiveWait,
                                             spawnLocal)
 import Control.Distributed.Process.Async   (Async, AsyncResult (..), async,
                                             asyncLinked, asyncWorker, task,
                                             wait)
 import Control.Distributed.Process.Closure (SerializableDict (..))
-import Control.Exception                   (Exception, throwTo)
+import Control.Exception                   (BlockedIndefinitelyOnMVar (..),
+                                            Exception, SomeException,
+                                            fromException, handle, throwTo)
+import Control.Monad.Catch                 (mask, onException, throwM, try)
 import Control.Monad.IO.Class              (liftIO)
 import Control.Monad.Reader                (ask, asks, runReaderT)
 import Control.Monad.Trans                 (lift)
 import Data.Binary                         (Binary)
 import Data.Kind                           (Type)
 import Data.Map.Strict                     qualified as Map
+import Data.Time.Clock                     (UTCTime, diffUTCTime,
+                                            getCurrentTime)
 import Data.Typeable                       (Typeable)
 import Hyperion                            (Dict (..), Job, JobEnv (..),
                                             Serializable, Static,
@@ -35,6 +44,7 @@ import Hyperion                            (Dict (..), Job, JobEnv (..),
 import Hyperion.CallClosure                (call')
 import Hyperion.Scheduler.Config           (Config (..))
 import Hyperion.Scheduler.Types            (Node (..))
+import System.Timeout                      (timeout)
 
 -- TODO orphan instance
 instance Static (Binary (SendPort ProcessId)) where
@@ -76,6 +86,47 @@ asyncLinkedLocalJob :: (Binary a, Typeable a) => Job a -> Job (Async a)
 asyncLinkedLocalJob j = do
   jobEnv <- ask
   lift $ asyncLinked $ task $ runReaderT j jobEnv
+
+-- | Thrown to the action of 'runUntil' to stop it.
+data RunUntilStopped = RunUntilStopped
+  deriving (Show, Exception)
+
+-- | Run the action until the given time. If it is not done by then, it is
+-- stopped, and this returns 'Nothing'. This returns, or throws, only after the
+-- action has ended, unless an exception interrupts the wait: then the action
+-- is still stopped, but may not have ended yet.
+runUntil :: UTCTime -> Job a -> Job (Maybe a)
+runUntil deadline action = do
+  jobEnv <- ask
+  lift $ mask $ \restore -> do
+    threadIdVar <- liftIO newEmptyMVar
+    resultVar <- liftIO newEmptyMVar
+    pid <- spawnLocal $ do
+      liftIO $ myThreadId >>= putMVar threadIdVar
+      try @_ @SomeException (restore (runReaderT action jobEnv))
+        >>= liftIO . putMVar resultVar
+    ref <- monitor pid
+    let
+      stop = do
+        -- From another thread, so that an interrupt of this stop does not
+        -- cancel it: throwTo blocks until the action can receive the exception.
+        -- The action may have died before it recorded its ThreadId.
+        _ <- liftIO $ forkIO $ handle (\BlockedIndefinitelyOnMVar -> pure ()) $
+          readMVar threadIdVar >>= flip throwTo RunUntilStopped
+        receiveWait
+          [matchIf (\(ProcessMonitorNotification ref' _ _) -> ref' == ref) (\_ -> pure ())]
+    now <- liftIO getCurrentTime
+    let micros = max 0 $ ceiling (1e6 * realToFrac (diffUTCTime deadline now) :: Double)
+    inTime <- restore (liftIO $ timeout micros $ takeMVar resultVar) `onException` stop
+    stop
+    -- The action can finish, or fail, between the timeout and the stop.
+    result <- maybe (liftIO $ tryTakeMVar resultVar) (pure . Just) inTime
+    case result of
+      Just (Right a) -> pure (Just a)
+      Just (Left e)
+        | Just RunUntilStopped <- fromException e -> pure Nothing
+        | otherwise                               -> throwM e
+      Nothing -> pure Nothing
 
 data AsyncFailedException= AsyncFailedException !ProcessId !String
   deriving (Show, Exception)

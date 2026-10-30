@@ -83,6 +83,7 @@ executables:
     - matrix
     - mtl
     - optparse-applicative
+    - time
     - vector
     ghc-options:
     - -threaded

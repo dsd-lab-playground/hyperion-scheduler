@@ -55,9 +55,10 @@ import System.Exit                             (die, exitSuccess)
 
 -- | Options shared by the local and cluster entry points.
 data ProblemOptions = ProblemOptions
-  { shift   :: Int
-  , dim     :: Int
-  , baseDir :: Maybe OsPath
+  { shift           :: Int
+  , dim             :: Int
+  , multiplyDelayMs :: Int
+  , baseDir         :: Maybe OsPath
   } deriving (Show)
 
 problemOptsParser :: Parser ProblemOptions
@@ -66,17 +67,25 @@ problemOptsParser = do
     <> help "Shift the input vector cyclically by this many positions (one layer per position)"
   dim <- option auto $ long "dim" <> metavar "INT" <> value 3
     <> help "Input vector size"
+  multiplyDelayMs <- option auto $ long "multiply-delay-ms" <> metavar "INT" <> value 0
+    <> help "How long each multiply task sleeps, in milliseconds"
   baseDir <- optional $ option (fromString <$> str) $ long "base-dir" <> metavar "DIR"
     <> help "Base directory for output files"
   pure ProblemOptions{..}
 
 toProblem :: ProblemOptions -> CyclicShiftProblem
-toProblem opts = MkCyclicShiftProblem { shift = opts.shift, dim = opts.dim }
+toProblem opts = MkCyclicShiftProblem
+  { shift = opts.shift
+  , dim = opts.dim
+  , multiplyDelayMs = opts.multiplyDelayMs
+  }
 
--- | @local@ options: 'ProblemOptions' plus the size of the fake node.
+-- | @local@ options: 'ProblemOptions', the size of the fake node, and the
+-- time after which the deadline pass stops.
 data LocalOptions = LocalOptions
-  { problem :: ProblemOptions
-  , cpus    :: Maybe Int
+  { problem   :: ProblemOptions
+  , cpus      :: Maybe Int
+  , stopAfter :: Maybe Double
   } deriving (Show)
 
 localOptsParser :: Parser LocalOptions
@@ -84,6 +93,8 @@ localOptsParser = do
   problem <- problemOptsParser
   cpus <- optional $ option auto $ long "cpus" <> metavar "INT"
     <> help "CPUs to give the local node (default: all available)"
+  stopAfter <- optional $ option auto $ long "stop-after" <> metavar "SECONDS"
+    <> help "Also run a pass that stops this long after its start, then finish it"
   pure LocalOptions{..}
 
 localOptsInfo :: ParserInfo LocalOptions
@@ -133,6 +144,7 @@ runLocal opts = withConcurrentOutput $ do
     -- 'runJobLocal' hardcodes one CPU; 'getJobNodes' reads this to size the node.
     local (\env -> env { jobNodeCpus = cpus }) $
       linearTransformJob (pure schedulerConfig) baseDir (toProblem opts.problem)
+        (realToFrac <$> opts.stopAfter)
 
 -- * Cluster runs
 
@@ -169,7 +181,7 @@ runOnCluster site = do
 
     clusterComputation opts = do
       baseDir <- liftIO $ maybe (TestConfig.getScratchDir site) makeAbsolute opts.problem.baseDir
-      remoteEvalJob $ static linearTransformJob
+      remoteEvalJob $ static (\c d p -> linearTransformJob c d p Nothing)
         `cAp` (static TestConfig.getSchedulerConfig `cAp` cPure site)
         `cAp` cPure (workDir baseDir opts)
         `cAp` cPure (toProblem opts.problem)

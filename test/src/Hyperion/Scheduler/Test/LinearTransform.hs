@@ -21,14 +21,16 @@
 module Hyperion.Scheduler.Test.LinearTransform where
 
 import Bootstrap.Build           (Fetches (..))
+import Control.Concurrent        (threadDelay)
 import Control.Exception         (AssertionFailed (..))
-import Control.Monad             (unless)
+import Control.Monad             (forM_, unless, when)
 import Control.Monad.IO.Class    (liftIO)
 import Data.Aeson                (FromJSON, ToJSON)
 import Data.Binary               (Binary)
 import Data.Matrix               (Matrix)
 import Data.Matrix               qualified as Matrix
 import Data.Maybe                (isJust)
+import Data.Time                 (NominalDiffTime, addUTCTime, getCurrentTime)
 import Data.Traversable          (for)
 import Data.Typeable             (Typeable)
 import Data.Vector               (Vector)
@@ -59,6 +61,8 @@ class (ToJSON a, Ord a, Show a, Binary a, Typeable a) => LinearTransformContext 
   layerMatrix :: a -> Closure (Int -> Matrix Int)
   inputVector :: a -> Closure (Vector Int)
   layerMatrixDims :: Int -> a -> (Int, Int)
+  -- | How long each multiply task sleeps, in microseconds.
+  multiplyDelay :: a -> Int
 
 layerInputVectorLength :: LinearTransformContext a => Int -> a -> Int
 layerInputVectorLength layerIndex ctx = ncols
@@ -108,6 +112,7 @@ computeMultiplyM :: (Applicative f, FetchesKey (VectorKey a) f, LinearTransformC
 computeMultiplyM key = do
   v <- fVector
   pure $ do
+    liftIO $ threadDelay (multiplyDelay key.ctx)
     getLayerMatrix' <- unClosure (layerMatrix key.ctx)
     let
       matrix = getLayerMatrix' key.layerIndex
@@ -291,8 +296,10 @@ instance IsStatKey VectorStatKey where
 -- position per layer. The output is @[shift+1, .., dim, 1, .., shift]@.
 -- @shift@ therefore controls the depth of the task graph and @dim@ its width.
 data CyclicShiftProblem = MkCyclicShiftProblem
-  { shift :: Int
-  , dim   :: Int
+  { shift           :: Int
+  , dim             :: Int
+  -- | How long each multiply task sleeps, in milliseconds.
+  , multiplyDelayMs :: Int
   }
   deriving (Eq, Ord, Generic, Binary, ToJSON, Show)
 
@@ -306,6 +313,7 @@ instance LinearTransformContext CyclicShiftProblem where
   layerMatrix x = static getLayerMatrix `cAp` cPure x
   inputVector x = static getInputVector `cAp` cPure x
   layerMatrixDims _layer x = (x.dim, x.dim)
+  multiplyDelay x = 1000 * x.multiplyDelayMs
 
 instance Static (LinearTransformContext CyclicShiftProblem) where
   closureDict = static Dict
@@ -408,11 +416,19 @@ instance
 -- directory, so the artifacts of both survive for inspection; the two share
 -- statistics because a stat key holds no paths.
 --
+-- With @stopAfter@, a third pass stops at a deadline that long after its
+-- start, and then runs again in the same directory to finish.
+--
 -- The scheduler config is passed as a 'Job' action (rather than a value) so
 -- that it can be evaluated on the node that actually runs the job: on a
 -- cluster it reads @SLURM_JOB_ID@ to find node-local storage.
-linearTransformJob :: Job Scheduler.Config -> OsPath -> CyclicShiftProblem -> Job ()
-linearTransformJob getSchedulerConfig baseDir problem = do
+linearTransformJob
+  :: Job Scheduler.Config
+  -> OsPath
+  -> CyclicShiftProblem
+  -> Maybe NominalDiffTime
+  -> Job ()
+linearTransformJob getSchedulerConfig baseDir problem stopAfter = do
   schedulerConfig <- getSchedulerConfig
   let
     relDir = "shift_" <> showOs problem.shift <> "_dim_" <> showOs problem.dim
@@ -434,16 +450,39 @@ linearTransformJob getSchedulerConfig baseDir problem = do
       -> Job [Scheduler.TaskRecord Scheduler.WrappedTask]
     runPass pass stats = do
       let resolver = resolverFor pass
+      startPass resolver
+      taskRecords <- Scheduler.runTasks schedulerConfig =<< planPass resolver stats
+      checkOutputVector resolver
+      pure taskRecords
+
+    startPass resolver = do
       Log.info "Running linear transform test" (problem, resolver)
       liftIO $ do
         removePathForcibly resolver.outDir
         createDirectoryIfMissing True resolver.outDir
-      taskMap <- Scheduler.runTaskFiles schedulerConfig $
-        Scheduler.mkEstimatedTaskMap stats
-          =<< mkTaskMap resolver () outputVectorKey
-      taskRecords <- Scheduler.runTasks schedulerConfig taskMap
+
+    planPass resolver stats = Scheduler.runTaskFiles schedulerConfig $
+      Scheduler.mkEstimatedTaskMap stats
+        =<< mkTaskMap resolver () outputVectorKey
+
+    -- Only the final vector is global, so the stopped pass leaves nothing for
+    -- the next one: the tasks it finished run again.
+    runPassStoppedAtDeadline stats delay = do
+      let resolver = resolverFor "until_deadline"
+      startPass resolver
+      start <- liftIO getCurrentTime
+      result <- Scheduler.runTasksUntil schedulerConfig (addUTCTime delay start)
+        =<< planPass resolver stats
+      case result of
+        Scheduler.Finished _ -> Log.throw $ AssertionFailed
+          "The pass finished before the deadline; increase --multiply-delay-ms"
+        Scheduler.StoppedAtDeadline records -> do
+          Log.info "Tasks finished before the deadline" (length records)
+          when (Scheduler.wroteGlobalOutput schedulerConfig records) $
+            Log.throw $ AssertionFailed
+              "The stopped pass wrote a global output, but only the last task has one"
+      _ <- Scheduler.runTasks schedulerConfig =<< planPass resolver stats
       checkOutputVector resolver
-      pure taskRecords
 
     checkOutputVector resolver = do
       outputValue <-
@@ -468,6 +507,7 @@ linearTransformJob getSchedulerConfig baseDir problem = do
   encodeJsonFileAtomic
     (problemDir </> "task_records_from_stats.json") secondRecords
   assertScheduledFromStats stats secondRecords
+  forM_ stopAfter $ runPassStoppedAtDeadline stats
 
 -- | Every task with an identity in statistics must have been scheduled from
 -- them, which is the point of having recorded them. A task without a stat key

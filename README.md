@@ -67,6 +67,14 @@ in the current directory and holds the results, the logs, and
 `node_local_storage/`, which stands in for a compute node's local scratch so the
 file-service and cleanup logic is exercised too.
 
+To test `runTasksUntil`, make the multiply tasks slow and add a pass that stops
+at a deadline before it finishes, and then runs again to finish:
+
+```sh
+stack exec -- hyperion-scheduler-test local \
+  --multiply-delay-ms 500 --stop-after 0.8
+```
+
 #### On a SLURM cluster
 
 ```sh

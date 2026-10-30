@@ -6,7 +6,13 @@
 {-# LANGUAGE StaticPointers        #-}
 
 module Hyperion.Scheduler.RunTasks
-(runTasks)
+( runTasks
+, runTasksUntil
+, RunResult (..)
+, runResultRecords
+, TaskRecords
+, wroteGlobalOutput
+)
 where
 
 import Control.Concurrent.STM                       (TVar, atomically, check,
@@ -20,7 +26,7 @@ import Control.Distributed.Process.Async            (Async)
 import Control.Distributed.Process.Async            qualified as Async
 import Control.Exception                            (evaluate)
 import Control.Monad                                (foldM, forM_, forever,
-                                                     unless, when)
+                                                     unless, void, when)
 import Control.Monad.Catch                          (Handler (..), catches)
 import Control.Monad.IO.Class                       (liftIO)
 import Control.Monad.Reader                         (lift)
@@ -31,10 +37,12 @@ import Data.List.NonEmpty                           qualified as NonEmpty
 import Data.Map.Strict                              (Map, (!?))
 import Data.Map.Strict                              qualified as Map
 import Data.Maybe                                   (catMaybes, fromMaybe,
-                                                     isNothing, listToMaybe)
+                                                     isJust, isNothing,
+                                                     listToMaybe)
 import Data.Set                                     (Set)
 import Data.Set                                     qualified as Set
-import Data.Time.Clock                              (addUTCTime, diffUTCTime,
+import Data.Time.Clock                              (UTCTime, addUTCTime,
+                                                     diffUTCTime,
                                                      getCurrentTime)
 import Hyperion                                     (Job, Process, RemoteError)
 import Hyperion.Log                                 qualified as Log
@@ -59,7 +67,7 @@ import Hyperion.Scheduler.FileService               (FileService, Response (..),
                                                      withFileService)
 import Hyperion.Scheduler.RemoteUtil                (AsyncFailedException (..),
                                                      asyncLinkedLocalJob,
-                                                     getJobNodes,
+                                                     getJobNodes, runUntil,
                                                      throwOnAsyncFailed)
 import Hyperion.Scheduler.RunTasks.NodeStatus       (NodeStatus)
 import Hyperion.Scheduler.RunTasks.NodeStatus       qualified as NodeStatus
@@ -551,6 +559,26 @@ monitorProgressAndDeps config taskQueue taskQueueNotifier taskQueueLock finished
 
 type TaskRecords a = [TaskRecord a]
 
+-- | The result of 'runTasksUntil'.
+data RunResult a
+  = Finished (TaskRecords a)
+  -- | The deadline passed before all tasks finished. The tasks still
+  -- running were killed. The records are of the tasks that finished.
+  | StoppedAtDeadline (TaskRecords a)
+  deriving (Functor)
+
+runResultRecords :: RunResult a -> TaskRecords a
+runResultRecords (Finished records)          = records
+runResultRecords (StoppedAtDeadline records) = records
+
+-- | Whether any of the tasks wrote an output that is not node-local. Only
+-- such outputs save work for a later run:
+-- 'Hyperion.Scheduler.TaskFiles.runTaskFiles' treats node-local paths as
+-- absent.
+wroteGlobalOutput :: IsTask a => Config -> TaskRecords a -> Bool
+wroteGlobalOutput config =
+  any (any (not . isNodeLocal config) . taskOutputPaths . (.task))
+
 -- | Run the given tasks on the given list of nodes by initially
 -- distributing largest memory tasks to nodes until we can't fit any
 -- more. As tasks finish on a node, we start new tasks on that node,
@@ -563,14 +591,34 @@ runTasks
   -> EstimatedTaskMap a
   -> Job (TaskRecords a)
 runTasks config taskMap =
-  map (fmap originalTask) <$> runTaskMap config (estimatedTasks taskMap)
+  runResultRecords . fmap originalTask <$> runTaskMap config Nothing (estimatedTasks taskMap)
+
+-- | 'runTasks', stopping at the given time.
+runTasksUntil
+  :: IsTask a
+  => Config
+  -> UTCTime
+  -> EstimatedTaskMap a
+  -> Job (RunResult a)
+runTasksUntil config deadline taskMap = do
+  now <- liftIO getCurrentTime
+  if now >= deadline
+    then pure (StoppedAtDeadline [])
+    else fmap originalTask <$> runTaskMap config (Just deadline) (estimatedTasks taskMap)
+
+-- | Run the action until the given time (see 'runUntil'). Returns whether it
+-- finished.
+finishesBefore :: Maybe UTCTime -> Job () -> Job Bool
+finishesBefore Nothing action         = True <$ action
+finishesBefore (Just deadline) action = isJust <$> runUntil deadline action
 
 runTaskMap
   :: IsTask a
   => Config
+  -> Maybe UTCTime
   -> TaskMap (EstimatedTask a)
-  -> Job (TaskRecords (EstimatedTask a))
-runTaskMap config taskMap = do
+  -> Job (RunResult (EstimatedTask a))
+runTaskMap config deadline taskMap = do
   let
     taskGraph = TaskGraph.fromEdges taskMap
     cleanupDependencies = buildCleanupDependenciesMap config taskMap
@@ -668,7 +716,7 @@ runTaskMap config taskMap = do
       cleanupLoopHandle <- asyncLinkedLocalJob $ cleanupLoop config fileService taskQueueNotifier cleanupQueue
       lift $ throwOnAsyncFailed cleanupLoopHandle
 
-      monitorProgressAndDeps
+      finished <- finishesBefore deadline $ monitorProgressAndDeps
         config
         taskQueue
         taskQueueNotifier
@@ -681,11 +729,16 @@ runTaskMap config taskMap = do
         (ProgressMap.fromTasksTodo (TaskGraph.keys taskGraph))
       -- NB: we use cancelWait instead of e.g. cancelKill to ensure that nodeLoop task will finish with AsyncCancelled.
       -- Finishing with AsyncFailed or AsyncLinkFailed will trigger throwOnAsyncFailed.
+      -- At the deadline, this also kills the running tasks: they are linked to their nodeLoop.
       mapM_ (lift . Async.cancelWait) nodeLoopHandleMap
-      _ <- lift $ Async.wait cleanupLoopHandle
+      -- The cleanup loop exits only after all tasks finish.
+      void $ lift $ (if finished then Async.wait else Async.cancelWait) cleanupLoopHandle
       records <- flushQueue taskRecordQueue
       reportAfterRun records
-      pure records
+      -- The deadline can come after the last task finished.
+      if finished || length records == Map.size taskMap
+        then pure (Finished records)
+        else StoppedAtDeadline records <$ Log.text "Stopped at the deadline"
 
 -- Files that can be removed (if there are no other dependencies)
 -- when the task finished

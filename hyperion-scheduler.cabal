@@ -131,6 +131,7 @@ executable hyperion-scheduler-test
     , matrix
     , mtl
     , optparse-applicative
+    , time
     , vector
   default-language: GHC2021
 
@@ -142,6 +143,7 @@ test-suite hyperion-scheduler-unit-test
       Hyperion.Scheduler.Test.Counted
       Hyperion.Scheduler.Test.EstimateTest
       Hyperion.Scheduler.Test.InputSummaryTest
+      Hyperion.Scheduler.Test.RunUntilTest
       Hyperion.Scheduler.Test.StorageStrategyTest
       Hyperion.Scheduler.Test.StoreFileTest
       Hyperion.Scheduler.Test.TaskFilesTest
