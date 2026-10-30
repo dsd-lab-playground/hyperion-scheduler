@@ -41,15 +41,16 @@ import Control.Monad.Catch                (MonadMask, bracket, bracketOnError)
 import Control.Monad.Reader               (asks)
 import Control.Monad.Trans                (MonadIO, lift, liftIO)
 import Data.Binary
+import Data.ByteString.Lazy               (ByteString)
 import Data.Map.Strict                    (Map, (!))
 import Data.Map.Strict                    qualified as Map
 import Data.Set                           qualified as Set
 import Data.Time.Clock                    (NominalDiffTime)
 import Data.Typeable                      (Typeable)
 import GHC.Clock                          (getMonotonicTimeNSec)
-import Hyperion                           (Closure, Job, JobEnv (..), Process,
-                                           ProgramInfo (..), Static (..),
-                                           WorkerAddr,
+import Hyperion                           (Closure, Dict (..), Job, JobEnv (..),
+                                           Process, ProgramInfo (..),
+                                           Static (..), WorkerAddr, cAp,
                                            remoteEvalOnWorkerWithCustomLog)
 import Hyperion.Log                       qualified as Log
 import Hyperion.OsPath                    (OsPath, dropExtension, (<.>), (</>))
@@ -57,12 +58,16 @@ import Hyperion.OsString                  (OsString, fromString)
 import Hyperion.Scheduler.ConcurrentQueue (ConcurrentQueue, flushQueue,
                                            newQueue, readQueue, writeQueue)
 import Hyperion.Scheduler.FilePath        (getAddr)
+import Hyperion.Scheduler.NodeSupervisor  (NodeSupervisor, runOnNodeSupervisor,
+                                           startNodeSupervisor,
+                                           stopNodeSupervisor)
 import Hyperion.Scheduler.ReusableWorker  (ReusableWorker (..),
                                            deleteReusableWorker,
                                            runOnReusableWorker,
                                            spawnRemoteReusableWorker)
 import Hyperion.Scheduler.Types           (Node (..))
 import Hyperion.Util                      (sanitizeFileString)
+import System.Environment                 (lookupEnv)
 
 data WorkerCpuId = WorkerCpuId
   { addr  :: WorkerAddr
@@ -80,12 +85,14 @@ data TWorker = TWorker
   , logPath           :: OsPath
   -- ReusableWorker is lazily initialized.
   , reusableWorkerVar :: MVar (Maybe ReusableWorker)
+  -- The node's supervisor, which launches this CPU's workers, if any.
+  , supervisor        :: Maybe NodeSupervisor
   }
 
-newTWorker :: WorkerCpuId -> OsPath -> Job TWorker
-newTWorker workerId logPath = do
+newTWorker :: WorkerCpuId -> OsPath -> Maybe NodeSupervisor -> Job TWorker
+newTWorker workerId logPath supervisor = do
   reusableWorkerVar <- liftIO $ newMVar Nothing
-  return $ TWorker workerId logPath reusableWorkerVar
+  return $ TWorker workerId logPath reusableWorkerVar supervisor
 
 -- We need our own MVar functions to make it work for Job monad
 modifyMVarMasked :: (MonadIO m, MonadMask m, NFData a) => MVar a -> (a -> m (a, b)) -> m b
@@ -121,10 +128,20 @@ deleteTWorker w =
       Nothing     -> pure ()
     pure Nothing
 
+-- | Run a closure on a new worker process, launched by the node's
+-- supervisor if there is one, or else by the master.
 remoteRunOnNewWorker
   :: (Typeable a, Static (Binary a))
   => TWorker -> Closure (Process a) -> Job a
-remoteRunOnNewWorker w = remoteEvalOnWorkerWithCustomLog (const w.logPath) w.workerId.addr
+remoteRunOnNewWorker w closure = case w.supervisor of
+  Just supervisor -> lift $ decode <$>
+    runOnNodeSupervisor supervisor w.workerId.cpuId
+      (static encodeResult `cAp` closureDict `cAp` closure)
+  Nothing ->
+    remoteEvalOnWorkerWithCustomLog (const w.logPath) w.workerId.addr closure
+
+encodeResult :: Dict (Binary a) -> Process a -> Process ByteString
+encodeResult Dict = fmap encode
 
 
 remoteRunOnReusableWorker
@@ -150,6 +167,7 @@ data Stats = Stats
 
 data NodeWorkerPool = NodeWorkerPool
   { workerMap   :: Map WorkerCpuId TWorker
+  , supervisor  :: Maybe NodeSupervisor
   , idleWorkers :: ConcurrentQueue WorkerCpuId
   -- Total CPU time for all finished jobs
   , cpuTimeVar  :: MVar TimeNanoSec
@@ -165,14 +183,23 @@ newNodeWorkerPool :: WorkerAddr -> Int -> OsPath -> Job NodeWorkerPool
 newNodeWorkerPool addr maxWorkers logDir = do
   let
     ids = map (WorkerCpuId addr) [0 .. maxWorkers - 1]
+  useSupervisor <- liftIO $ (/= Just "0") <$> lookupEnv nodeSupervisorsVar
+  supervisor <- if useSupervisor
+    then Just <$> startNodeSupervisor addr (map (getLogPath logDir) ids)
+    else pure Nothing
   workerMap <- fmap Map.fromList $ forM ids $ \w -> do
-    tWorker <- newTWorker w $ getLogPath logDir w
+    tWorker <- newTWorker w (getLogPath logDir w) supervisor
     return (w, tWorker)
   liftIO $ do
     idle <- newQueue
     mapM_ (writeQueue idle) ids
     cpuTimeVar <- newMVar 0
-    return $ NodeWorkerPool workerMap idle cpuTimeVar
+    return $ NodeWorkerPool workerMap supervisor idle cpuTimeVar
+
+-- | Set to @0@ to launch task workers from the master instead of from a
+-- 'NodeSupervisor' on each node.
+nodeSupervisorsVar :: String
+nodeSupervisorsVar = "HYPERION_SCHEDULER_NODE_SUPERVISORS"
 
 deleteNodeWorkerPool :: NodeWorkerPool -> Job ()
 deleteNodeWorkerPool pool = do
@@ -184,6 +211,7 @@ deleteNodeWorkerPool pool = do
     Log.warn "NodeWorkerPool shutdown: some workers are still busy" $
       Set.map workerCpuIdToString busy
   mapM_ deleteTWorker $ Map.elems pool.workerMap
+  mapM_ (lift . stopNodeSupervisor) pool.supervisor
 
 
 -- WorkerPool

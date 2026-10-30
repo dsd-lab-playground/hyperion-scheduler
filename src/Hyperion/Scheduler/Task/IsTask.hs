@@ -63,6 +63,9 @@ class (Typeable a, ToJSON a, Eq a, Ord a) => IsTask a where
   taskTag :: a -> Maybe Tag
   taskTag = defaultTaskTag
 
+  -- | The work of the task, given its number of CPUs. It runs on a fresh
+  -- worker with one capability; for parallel Haskell, call
+  -- 'Control.Concurrent.setNumCapabilities'.
   taskClosure :: a -> Maybe (NumCPUs -> Closure (Process ()))
 
   -- | Whether this task is a placeholder (see 'Hyperion.Scheduler.Task.Task.TaskKind')

@@ -47,8 +47,8 @@ import Options.Applicative                     (Parser, ParserInfo, auto,
 import System.Console.Concurrent               (withConcurrentOutput)
 import System.Directory.OsPath                 (createDirectoryIfMissing,
                                                 makeAbsolute)
-import System.Environment                      (getArgs, lookupEnv, withArgs,
-                                                withProgName)
+import System.Environment                      (getArgs, lookupEnv, setEnv,
+                                                withArgs, withProgName)
 import System.Exit                             (die, exitSuccess)
 
 -- * Options
@@ -127,6 +127,8 @@ runLocal opts = withConcurrentOutput $ do
       }
     schedulerConfig = TestConfig.localSchedulerConfig (baseDir </> "node_local_storage")
   Log.info "Running locally" (baseDir, cpus)
+  -- Worker processes that the scheduler's node supervisor launches inherit it.
+  setEnv localWorkersEnvVar "1"
   runJobLocal defaultHyperionStaticConfig programInfo $
     -- 'runJobLocal' hardcodes one CPU; 'getJobNodes' reads this to size the node.
     local (\env -> env { jobNodeCpus = cpus }) $
@@ -143,9 +145,18 @@ getSite = lookupEnv siteEnvVar >>= \case
   Nothing -> pure TestConfig.defaultSite
   Just s  -> either (die . ((siteEnvVar <> ": ") <>)) pure (TestConfig.parseSite s)
 
+-- | Set by @local@ for the worker processes it launches, which must use its
+-- 'HyperionStaticConfig' rather than the site's.
+localWorkersEnvVar :: String
+localWorkersEnvVar = "HYPERION_SCHEDULER_TEST_LOCAL_WORKERS"
+
 runOnCluster :: Site -> IO ()
-runOnCluster site =
-  hyperionMain masterOptsParser mkHyperionConfig (TestConfig.hyperionStaticConfig site) clusterComputation
+runOnCluster site = do
+  isLocalWorker <- (== Just "1") <$> lookupEnv localWorkersEnvVar
+  let staticConfig
+        | isLocalWorker = defaultHyperionStaticConfig
+        | otherwise     = TestConfig.hyperionStaticConfig site
+  hyperionMain masterOptsParser mkHyperionConfig staticConfig clusterComputation
   where
     -- Keep runs with different allocations side by side, so their task stats
     -- can be compared.

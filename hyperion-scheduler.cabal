@@ -23,6 +23,7 @@ library
       Hyperion.Scheduler.FileService.FileSender
       Hyperion.Scheduler.FileService.NodeLocalFileManager
       Hyperion.Scheduler.FileService.RetryTimeout
+      Hyperion.Scheduler.NodeSupervisor
       Hyperion.Scheduler.PathResolver
       Hyperion.Scheduler.PathResolver.StorageStrategy
       Hyperion.Scheduler.RemoteUtil
@@ -85,6 +86,7 @@ library
     , mtl
     , os-string
     , pqueue
+    , process
     , stm
     , store
     , strict-concurrency

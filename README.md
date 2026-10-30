@@ -10,6 +10,21 @@ cleans them up when they are no longer needed.
 - [Stat keys and input summaries](docs/stat-key-inputs-design.md): how tasks
   are estimated, and how recorded statistics correct the estimates.
 
+## Worker launch
+
+Each task runs on a new worker process. A supervisor on each node launches
+these workers, keeping one ready per CPU, so the master sends one message per
+task. The supervisor runs on 2 capabilities and each worker on 1, whatever
+the RTS options of the program and the CPUs of the task (in a threaded RTS).
+A task that wants parallel Haskell can call `setNumCapabilities` itself.
+
+The ready workers use memory that task estimates do not count: 20–40 MB each
+on Expanse, i.e. 3–5 GB per node at 128 CPUs. Leave room for it when you set
+`nodeMemory`.
+
+With `HYPERION_SCHEDULER_NODE_SUPERVISORS=0`, read by the master, the master
+launches each worker itself.
+
 ## Building
 
 ```sh
@@ -44,9 +59,10 @@ stack exec -- hyperion-scheduler-test local \
   --shift 5 --dim 20 --base-dir /tmp/lt-test
 ```
 
-Everything runs in one process: workers are spawned as local threads, and a
-single node is reported to the scheduler with `--cpus` CPUs (all cores by
-default). `--base-dir` defaults to `tmp/hyperion-scheduler-linear-transform-test`
+The scheduler and its node supervisor run in this process, and each task runs
+on a new worker process (or on a thread of this process, with
+`HYPERION_SCHEDULER_NODE_SUPERVISORS=0`). A single node is reported to the
+scheduler with `--cpus` CPUs (all cores by default). `--base-dir` defaults to `tmp/hyperion-scheduler-linear-transform-test`
 in the current directory and holds the results, the logs, and
 `node_local_storage/`, which stands in for a compute node's local scratch so the
 file-service and cleanup logic is exercised too.

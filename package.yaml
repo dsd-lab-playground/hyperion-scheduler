@@ -47,6 +47,7 @@ library:
   - mtl
   - os-string
   - pqueue
+  - process
   - stm
   - store
   - strict-concurrency
