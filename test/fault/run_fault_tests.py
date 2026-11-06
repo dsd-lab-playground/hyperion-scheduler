@@ -56,6 +56,9 @@ ARMS = [
         env=fault("hang", r"fakeb\.[0-9]+\.log$", FAULT_PARENT_RE=r"/0/0\.log$"), text=r"ReusableWorker.*did not start"),
     arm("nosup-badport", "fail", "job 55556183's shape: the master launches, the worker can't connect",
         env={**OFF, **fault("badport", SLOT, FAULT_AT=2)}, text=r"WorkerConnectionTimeout"),
+    arm("launcher-hang", "success", "the pretend node's launcher never connects: hyperion's own nodeLauncherTimeoutRetries, "
+        "set by this test's site, launches it again",
+        env=fault("hang", r"/0/0\.log$")),
     arm("task-kill", "fail", "SIGKILL of a worker in a native task on the pretend node",
         kill="task", slow=LONG, every=True, text=r"worker died|Task failed on slot"),
     arm("task-kill-retry", "success", "the same, then hyperion's retry on the held job: the answer must be right",
