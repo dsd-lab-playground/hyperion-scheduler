@@ -80,6 +80,7 @@ import Hyperion.Log                  qualified as Log
 import Hyperion.OsPath               (OsPath)
 import Hyperion.OsString             (OsString, toString)
 import Hyperion.Scheduler.RemoteUtil (spawnLocalJob)
+import Hyperion.Scheduler.Util       (closeOpenFdsOnExec)
 import Hyperion.Util                 (myExecutable, tryLogException)
 import System.CPUTime                (getCPUTime)
 import System.Exit                   (ExitCode (..))
@@ -167,6 +168,9 @@ data SupervisorState = SupervisorState
 -- slot's workers).
 supervisorMain :: [OsPath] -> SendPort ProcessId -> Process ()
 supervisorMain logPaths startupPort = do
+  -- Its workers would otherwise hold its connection to the master open, so the
+  -- master wouldn't notice if it died.
+  liftIO closeOpenFdsOnExec
   -- In local mode the supervisor shares the master's process.
   selfNode <- getSelfNode
   let masterNode = processNodeId $ sendPortProcessId $ sendPortId startupPort

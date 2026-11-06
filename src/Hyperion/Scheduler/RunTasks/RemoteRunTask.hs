@@ -25,6 +25,7 @@ import Hyperion.Log                   qualified as Log
 import Hyperion.Scheduler.FilePath    (VirtualFilePath (VirtualFilePath))
 import Hyperion.Scheduler.Task.IsTask (IsTask (..), taskOutputPaths)
 import Hyperion.Scheduler.Types       (FileSize (..), MemorySize (..), NumCPUs)
+import Hyperion.Scheduler.Util        (closeOpenFdsOnExec)
 import Hyperion.Scheduler.WorkerPool  (TWorker, remoteRunOnNewWorker)
 import Hyperion.Util                  (peakResidentSetSizeSelfOrChildren)
 import System.Directory.OsPath        (getFileSize)
@@ -54,6 +55,9 @@ afterReturnRemoteRunTaskResultM
   -> m ()
   -> m RemoteRunTaskResult
 afterReturnRemoteRunTaskResultM files go = do
+  -- A native the task starts would otherwise hold this worker's connections
+  -- open, so that nothing would notice this worker's death until the native ended.
+  liftIO closeOpenFdsOnExec
   mem <- afterReturnMemoryM go
   let
     getFileSize' (VirtualFilePath p) = liftIO $ getFileSize p
