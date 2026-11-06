@@ -21,7 +21,8 @@ import Control.Distributed.Process.Async            qualified as Async
 import Control.Exception                            (evaluate)
 import Control.Monad                                (foldM, forM_, forever,
                                                      unless, when)
-import Control.Monad.Catch                          (Handler (..), catches)
+import Control.Monad.Catch                          (Handler (..), catches,
+                                                     onException)
 import Control.Monad.IO.Class                       (liftIO)
 import Control.Monad.Reader                         (lift)
 import Control.Monad.Writer                         (Writer, runWriter, tell)
@@ -53,14 +54,19 @@ import Hyperion.Scheduler.FileService               (FileService, Response (..),
                                                      deleteFilesFromAllNodes,
                                                      deleteGlobalFiles,
                                                      fetchFilesToNode,
+                                                     fileServiceProcesses,
                                                      incrementActiveFileUsages,
                                                      registerFilesOnNode,
                                                      reserveFilesOnNode,
                                                      withFileService)
 import Hyperion.Scheduler.RemoteUtil                (AsyncFailedException (..),
                                                      asyncLinkedLocalJob,
+                                                     awaitProcessesEnd,
                                                      getJobNodes,
-                                                     throwOnAsyncFailed)
+                                                     getWorkerConnectSeconds,
+                                                     throwOnAsyncFailed,
+                                                     withServiceWatch,
+                                                     withWorkerConnectLimit)
 import Hyperion.Scheduler.RunTasks.NodeStatus       (NodeStatus)
 import Hyperion.Scheduler.RunTasks.NodeStatus       qualified as NodeStatus
 import Hyperion.Scheduler.RunTasks.ProgressMap      (ProgressMap)
@@ -114,7 +120,8 @@ import Hyperion.Scheduler.WorkerPool                (TWorker (workerId),
                                                      toReusableWorker,
                                                      withWorkerPool,
                                                      withWorkersFromPool,
-                                                     workerCpuIdToString)
+                                                     workerCpuIdToString,
+                                                     workerPoolProcesses)
 
 -- Each task info has input and output files stored as VirtualFilePath's, i.e. global paths like /expanse/lustre/path/to/task.output
 -- In fact, tasks will write their output either to that location (GlobalFilePath), or to a Local storage (NodeLocalFilePath), depending on Scheduler storage policy.
@@ -577,7 +584,11 @@ runTaskMap config taskMap = do
   either Log.throw pure $ validateNodeLocalInputs config taskMap
   nodes <- getJobNodes config
   reportBeforeRun config nodes taskMap
-  withFileService config nodes $ \fileService -> withWorkerPool nodes $ \workerPool -> do
+  connectSeconds <- liftIO getWorkerConnectSeconds
+  withWorkerConnectLimit connectSeconds $
+    withFileService config nodes $ \fileService ->
+    withWorkerPool nodes $ \workerPool ->
+    withServiceWatch (fileServiceProcesses fileService <> workerPoolProcesses workerPool) $ do
       let
         getTaskPriority = taskPriority $ mkTaskPriorityHelper nodes taskGraph
         -- TODO: check disk space when computing initialAllocs
@@ -668,7 +679,15 @@ runTaskMap config taskMap = do
       cleanupLoopHandle <- asyncLinkedLocalJob $ cleanupLoop config fileService taskQueueNotifier cleanupQueue
       lift $ throwOnAsyncFailed cleanupLoopHandle
 
-      monitorProgressAndDeps
+      let
+        -- A failed run ends the node loops, and with them their tasks, before
+        -- anything stops. Stopping a supervisor would fail its tasks, whose
+        -- failures would interrupt the stopping of the other nodes.
+        cancelNodeLoops = lift $ do
+          mapM_ Async.cancel nodeLoopHandleMap
+          awaitProcessesEnd $ map Async.asyncWorker $ Map.elems nodeLoopHandleMap
+
+      flip onException cancelNodeLoops $ monitorProgressAndDeps
         config
         taskQueue
         taskQueueNotifier

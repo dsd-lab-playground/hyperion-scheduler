@@ -36,14 +36,18 @@ module Hyperion.Scheduler.WorkerPool where
 import Control.Concurrent.MVar.Strict     (MVar, modifyMVar_, newMVar, putMVar,
                                            readMVar, takeMVar, tryPutMVar)
 import Control.DeepSeq                    (NFData)
-import Control.Monad                      (forM, replicateM, when)
-import Control.Monad.Catch                (MonadMask, bracket, bracketOnError)
+import Control.Distributed.Process        (ProcessId)
+import Control.Exception                  (SomeException)
+import Control.Monad                      (forM, forM_, replicateM, when)
+import Control.Monad.Catch                (MonadMask, bracket, bracketOnError,
+                                           catch, finally)
 import Control.Monad.Reader               (asks)
 import Control.Monad.Trans                (MonadIO, lift, liftIO)
 import Data.Binary
 import Data.ByteString.Lazy               (ByteString)
 import Data.Map.Strict                    (Map, (!))
 import Data.Map.Strict                    qualified as Map
+import Data.Maybe                         (catMaybes)
 import Data.Set                           qualified as Set
 import Data.Time.Clock                    (NominalDiffTime)
 import Data.Typeable                      (Typeable)
@@ -58,9 +62,14 @@ import Hyperion.OsString                  (OsString, fromString)
 import Hyperion.Scheduler.ConcurrentQueue (ConcurrentQueue, flushQueue,
                                            newQueue, readQueue, writeQueue)
 import Hyperion.Scheduler.FilePath        (getAddr)
-import Hyperion.Scheduler.NodeSupervisor  (NodeSupervisor, runOnNodeSupervisor,
+import Hyperion.Scheduler.NodeSupervisor  (NodeSupervisor,
+                                           nodeSupervisorProcess,
+                                           runOnNodeSupervisor,
                                            startNodeSupervisor,
                                            stopNodeSupervisor)
+import Hyperion.Scheduler.RemoteUtil      (awaitProcessesEnd,
+                                           getWorkerConnectSeconds,
+                                           startAllOrNone)
 import Hyperion.Scheduler.ReusableWorker  (ReusableWorker (..),
                                            deleteReusableWorker,
                                            runOnReusableWorker,
@@ -84,7 +93,7 @@ data TWorker = TWorker
   { workerId          :: WorkerCpuId
   , logPath           :: OsPath
   -- ReusableWorker is lazily initialized.
-  , reusableWorkerVar :: MVar (Maybe ReusableWorker)
+  , reusableWorkerVar :: MVar (Maybe (ReusableWorker, ProcessId))
   -- The node's supervisor, which launches this CPU's workers, if any.
   , supervisor        :: Maybe NodeSupervisor
   }
@@ -105,12 +114,6 @@ modifyMVarMasked mVar go =
     liftIO $ putMVar mVar x'
     pure res
 
-modifyMVarMasked_ :: (MonadIO m, MonadMask m, NFData a) => MVar a -> (a -> m a) -> m ()
-modifyMVarMasked_ mVar go =
-  modifyMVarMasked mVar $ \x -> do
-    x' <- go x
-    pure (x', ())
-
 -- Lazy initialization for ReusableWorker
 toReusableWorker :: TWorker -> Job ReusableWorker
 toReusableWorker w =
@@ -118,15 +121,17 @@ toReusableWorker w =
     worker <- case mWorker of
       Just worker' -> pure worker'
       Nothing      -> spawnRemoteReusableWorker w.workerId.addr $ Just w.logPath
-    pure (Just worker, worker)
+    pure (Just worker, fst worker)
 
-deleteTWorker :: TWorker -> Job ()
+-- | Stop the worker's reusable worker, if any, and return the local process
+-- that launched it, for 'awaitProcessesEnd'.
+deleteTWorker :: TWorker -> Job (Maybe ProcessId)
 deleteTWorker w =
-  modifyMVarMasked_ w.reusableWorkerVar $ \mWorker -> do
-    case mWorker of
-      Just worker -> lift $ deleteReusableWorker worker
-      Nothing     -> pure ()
-    pure Nothing
+  modifyMVarMasked w.reusableWorkerVar $ \mWorker -> case mWorker of
+    Just (worker, launching) -> do
+      lift $ deleteReusableWorker worker
+      pure (Nothing, Just launching)
+    Nothing -> pure (Nothing, Nothing)
 
 -- | Run a closure on a new worker process, launched by the node's
 -- supervisor if there is one, or else by the master.
@@ -185,7 +190,9 @@ newNodeWorkerPool addr maxWorkers logDir = do
     ids = map (WorkerCpuId addr) [0 .. maxWorkers - 1]
   useSupervisor <- liftIO $ (/= Just "0") <$> lookupEnv nodeSupervisorsVar
   supervisor <- if useSupervisor
-    then Just <$> startNodeSupervisor addr (map (getLogPath logDir) ids)
+    then do
+      connectSeconds <- liftIO getWorkerConnectSeconds
+      Just <$> startNodeSupervisor connectSeconds addr (map (getLogPath logDir) ids)
     else pure Nothing
   workerMap <- fmap Map.fromList $ forM ids $ \w -> do
     tWorker <- newTWorker w (getLogPath logDir w) supervisor
@@ -210,8 +217,9 @@ deleteNodeWorkerPool pool = do
   when (not $ Set.null busy) $ do
     Log.warn "NodeWorkerPool shutdown: some workers are still busy" $
       Set.map workerCpuIdToString busy
-  mapM_ deleteTWorker $ Map.elems pool.workerMap
-  mapM_ (lift . stopNodeSupervisor) pool.supervisor
+  launching <- mapM deleteTWorker $ Map.elems pool.workerMap
+  lift (awaitProcessesEnd $ catMaybes launching)
+    `finally` mapM_ (lift . stopNodeSupervisor) pool.supervisor
 
 
 -- WorkerPool
@@ -228,10 +236,19 @@ newWorkerPool nodes = do
   maybeLogFile <- Log.getLogFile
   let logDir = maybe (programLogDir </> "workers") dropExtension maybeLogFile
   nodeMap <- fmap Map.fromList $
-    forM nodes $ \node -> do
-      pool <- newNodeWorkerPool node.address node.cpus logDir
-      return (node.address, pool)
+    startAllOrNone
+      (\node -> do
+        pool <- newNodeWorkerPool node.address node.cpus logDir
+        return (node.address, pool))
+      (deleteNodeWorkerPool . snd)
+      nodes
   return $ WorkerPool nodeMap logDir
+
+-- | The node supervisors' processes, named for error messages.
+workerPoolProcesses :: WorkerPool -> [(String, ProcessId)]
+workerPoolProcesses pool =
+  [ ("NodeSupervisor on " <> show addr, nodeSupervisorProcess supervisor)
+  | (addr, NodeWorkerPool { supervisor = Just supervisor }) <- Map.toList pool.nodeMap ]
 
 withWorkerPool :: [Node] -> (WorkerPool -> Job a) -> Job a
 withWorkerPool nodes go = bracket acquire release go' where
@@ -249,7 +266,10 @@ withWorkerPool nodes go = bracket acquire release go' where
       getNodeCpuTime n = liftIO $ readMVar n.cpuTimeVar
     cpuTime <- sum <$> mapM getNodeCpuTime nodePools
     liftIO $ printStats cpuTime startTime endTime
-    mapM_ deleteNodeWorkerPool nodePools
+    -- In a failed run another task's failure can arrive here as an exception. It
+    -- must not leave the other nodes' supervisors and workers running.
+    forM_ nodePools $ \nodePool -> deleteNodeWorkerPool nodePool `catch`
+      \(e :: SomeException) -> Log.warn "While stopping a node's workers" (show e)
 
   go' (_, pool) = go pool
 

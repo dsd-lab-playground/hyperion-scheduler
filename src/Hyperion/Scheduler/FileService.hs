@@ -21,6 +21,7 @@ module Hyperion.Scheduler.FileService
   (FileService
   , Response(..)
   , withFileService
+  , fileServiceProcesses
   , fetchFilesToNode
   , deleteGlobalFiles
   , deleteFilesFromNode
@@ -32,7 +33,7 @@ module Hyperion.Scheduler.FileService
   ) where
 
 
-import Control.Distributed.Process                         ()
+import Control.Distributed.Process                         (ProcessId)
 import Control.Exception                                   (SomeException,
                                                             catch, tryJust)
 import Control.Monad                                       (guard, unless)
@@ -59,8 +60,14 @@ import System.IO.Error                                     (isDoesNotExistError)
 
 data FileService = MkFileService
   { config   :: Config
+  , senders  :: FileSenders
   , managers :: NodeLocalFileManagers
   }
+
+-- | The service's processes, named for error messages.
+fileServiceProcesses :: FileService -> [(String, ProcessId)]
+fileServiceProcesses service =
+  fileSenderProcesses service.senders <> fileManagerProcesses service.managers
 
 withFileService :: Config -> [Node] -> (FileService -> Job a) -> Job a
 withFileService config nodes go = do
@@ -87,8 +94,8 @@ withFileService config nodes go = do
       , reportInterval = config.reportInterval
       }
     nodesConfig = map (\node -> (node.address, mkManagerConfig node)) nodes
-    go' fileSenders = withNodeLocalFileManagers fileSenders nodesConfig go''
-    go'' fileManagers = go $ MkFileService config fileManagers
+    go' fileSenders = withNodeLocalFileManagers fileSenders nodesConfig (go'' fileSenders)
+    go'' fileSenders fileManagers = go $ MkFileService config fileSenders fileManagers
 
   withFileSenders senderConfig (map (.address) nodes) go'
 

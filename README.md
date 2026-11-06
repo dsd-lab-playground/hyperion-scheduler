@@ -25,6 +25,35 @@ on Expanse, i.e. 3–5 GB per node at 128 CPUs. Leave room for it when you set
 With `HYPERION_SCHEDULER_NODE_SUPERVISORS=0`, read by the master, the master
 launches each worker itself.
 
+## Lost workers
+
+A generation holds all its nodes, so a worker that is lost must not leave them
+idle while the job still looks healthy.
+
+- A worker may take `HYPERION_SCHEDULER_WORKER_CONNECT_TIMEOUT` seconds to
+  connect (default 300, `0` for no limit), read by the master. The limit ends at
+  the connection, so it doesn't limit how long a task runs.
+- A task worker lost before it connects has been sent no work, so it is launched
+  again, up to 3 launches. After that the task fails.
+- A worker that dies in a task fails the run. The task isn't run again, since it
+  may have left partial output and something must decide who owns it. A native it
+  started goes on until it ends or the allocation does.
+- A file sender, file manager or node supervisor that doesn't start, or dies
+  during the run, fails the run with an error naming it and its node. If a node
+  supervisor dies, its workers stay until the allocation ends.
+
+A process's death is noticed when its connections close. So a supervisor and a
+worker about to run a task mark their open descriptors close-on-exec: a child
+would otherwise hold them open for as long as it runs.
+
+When a run ends, well or not, it stops every node's workers and services, and
+waits up to 10 s at each stop for their workers to be told to shut down, so that
+none stays behind in the allocation.
+
+A connected worker that hangs can't be told from a long native task, so nothing
+here detects it. Files written to global storage stay after a failure;
+node-local files go with the allocation.
+
 ## Building
 
 ```sh

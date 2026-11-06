@@ -32,6 +32,7 @@
 module Hyperion.Scheduler.FileService.NodeLocalFileManager
   ( NodeLocalFileManager (..)
   , NodeLocalFileManagers (..)
+  , fileManagerProcesses
   , NodeLocalFileManagerConfig (..)
   , Response(..)
   , withNodeLocalFileManagers
@@ -111,6 +112,8 @@ import Hyperion.Scheduler.RemoteUtil               (RequestType, ResponseType,
                                                     Service (..),
                                                     StartupResponseType,
                                                     getServiceProcessId,
+                                                    awaitProcessesEnd,
+                                                    startAllOrNone,
                                                     startRemoteService)
 import Hyperion.Scheduler.ReusableWorker           (ReusableWorker (..),
                                                     getNodeId,
@@ -138,6 +141,12 @@ data NodeLocalFileManager = NodeLocalFileManager
 
 data NodeLocalFileManagers = NodeLocalFileManagers (Map WorkerAddr NodeLocalFileManager)
   deriving(Generic, Binary)
+
+-- | The managers' processes, named for error messages.
+fileManagerProcesses :: NodeLocalFileManagers -> [(String, ProcessId)]
+fileManagerProcesses (NodeLocalFileManagers managers) =
+  [ ("NodeLocalFileManager on " <> show node, manager.pid)
+  | (node, manager) <- Map.toList managers ]
 
 data NodeLocalFileManagerConfig = MkNodeLocalFileManagerConfig
   { retryPolicy                :: RetryTimeoutPolicy
@@ -222,15 +231,19 @@ withNodeLocalFileManagers
   -> [(WorkerAddr, NodeLocalFileManagerConfig)]
   -> (NodeLocalFileManagers -> Job a)
   -> Job a
-withNodeLocalFileManagers fileSenders nodesConfig = bracket acquire release where
+withNodeLocalFileManagers fileSenders nodesConfig go = bracket acquire release (go . fst) where
   acquire = do
-    managers <- forM nodesConfig $ \(node, config) -> do
-      manager <- startFileManager config fileSenders node
-      return (node, manager)
-    return $ NodeLocalFileManagers $ Map.fromList managers
+    managers <- startAllOrNone
+      (\(node, config) -> do
+        (manager, launching) <- startFileManager config fileSenders node
+        return ((node, manager), launching))
+      (\((_, manager), launching) -> shutdown' manager >> lift (awaitProcessesEnd [launching]))
+      nodesConfig
+    return (NodeLocalFileManagers $ Map.fromList $ map fst managers, map snd managers)
 
-  release (NodeLocalFileManagers managerMap) = do
+  release (NodeLocalFileManagers managerMap, launching) = do
     mapM_ shutdown' $ Map.elems managerMap
+    lift $ awaitProcessesEnd launching
 
   shutdown' manager = lift $ shutdown manager.pid
 
@@ -301,7 +314,7 @@ sendRequestAndGetResponse manager request = do
   cast manager.pid $ request responseSendPort
   receiveChan responseReceivePort
 
-startFileManager :: NodeLocalFileManagerConfig -> FileSenders -> WorkerAddr -> Job NodeLocalFileManager
+startFileManager :: NodeLocalFileManagerConfig -> FileSenders -> WorkerAddr -> Job (NodeLocalFileManager, ProcessId)
 startFileManager config fileSenders node = do
   let
     getClosure startupResponseSendPort =
@@ -310,8 +323,8 @@ startFileManager config fileSenders node = do
       `cAp` cPure fileSenders
       `cAp` cPure startupResponseSendPort
   Log.info "Start remote NodeLocalFileManager" node
-  pid <- startRemoteService @NodeLocalFileManager node getClosure
-  return $ NodeLocalFileManager config node pid
+  (pid, launching) <- startRemoteService @NodeLocalFileManager "NodeLocalFileManager" node getClosure
+  return (NodeLocalFileManager config node pid, launching)
 
 -- Statistics
 

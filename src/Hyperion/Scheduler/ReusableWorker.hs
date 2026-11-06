@@ -12,8 +12,7 @@ import Control.DeepSeq                            (NFData)
 import Control.Distributed.Process                (NodeId, Process, ProcessId,
                                                    SendPort, getSelfPid, link,
                                                    newChan, processNodeId,
-                                                   receiveChan, sendChan,
-                                                   spawnLocal, unlink)
+                                                   sendChan, spawnLocal, unlink)
 import Control.Distributed.Process.Extras.Time    (Delay (..))
 import Control.Distributed.Process.ManagedProcess
 import Control.Monad.Catch                        (bracket)
@@ -27,7 +26,8 @@ import Hyperion                                   (Closure, Dict (..), Job,
                                                    remoteEvalOnWorkerWithCustomLog)
 import Hyperion.Log                               qualified as Log
 import Hyperion.OsPath                            (OsPath)
-import Hyperion.Scheduler.RemoteUtil              (callOnNode, spawnLocalJob)
+import Hyperion.Scheduler.RemoteUtil              (awaitServiceStart, callOnNode,
+                                                   spawnLocalJob)
 
 data ReusableWorker = ReusableWorker ProcessId
   deriving (Generic, Binary, Eq, Show, Ord, NFData)
@@ -51,19 +51,21 @@ withLocalReusableWorker = bracket acquire release where
   release (ReusableWorker pid) = shutdown pid
 
 
-spawnRemoteReusableWorker :: WorkerAddr -> Maybe OsPath -> Job ReusableWorker
+-- | Also returns the local process launching the worker.
+spawnRemoteReusableWorker :: WorkerAddr -> Maybe OsPath -> Job (ReusableWorker, ProcessId)
 spawnRemoteReusableWorker workerAddr mLogPath = do
   (sendPort, receivePort) <- lift $ newChan
   let
     remoteEval = case mLogPath of
       Just logPath -> remoteEvalOnWorkerWithCustomLog (const logPath)
       Nothing      -> remoteEvalOnWorker
-  _ <- spawnLocalJob $ remoteEval workerAddr $
+  launching <- spawnLocalJob $ remoteEval workerAddr $
     static startReusableWorker `cAp` cPure sendPort
-  workerPid <- lift $ receiveChan receivePort
+  workerPid <- lift $ awaitServiceStart
+    ("ReusableWorker on " <> show workerAddr) launching receivePort
   lift $ link workerPid
   Log.info "Spawned ReusableWorker" (workerAddr, workerPid)
-  return $ ReusableWorker workerPid
+  return (ReusableWorker workerPid, launching)
 
   where
   startReusableWorker :: SendPort ProcessId -> Process ()

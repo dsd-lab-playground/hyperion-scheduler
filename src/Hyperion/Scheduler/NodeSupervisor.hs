@@ -31,6 +31,7 @@ module Hyperion.Scheduler.NodeSupervisor
   , startNodeSupervisor
   , stopNodeSupervisor
   , runOnNodeSupervisor
+  , nodeSupervisorProcess
   ) where
 
 import Control.Concurrent            (forkIO, getNumCapabilities, myThreadId,
@@ -79,7 +80,8 @@ import Hyperion.Command              (hyperionWorkerCommand)
 import Hyperion.Log                  qualified as Log
 import Hyperion.OsPath               (OsPath)
 import Hyperion.OsString             (OsString, toString)
-import Hyperion.Scheduler.RemoteUtil (spawnLocalJob)
+import Hyperion.Scheduler.RemoteUtil (awaitServiceStart, awaitProcessesEnd,
+                                      connectLimit, spawnLocalJob)
 import Hyperion.Scheduler.Util       (closeOpenFdsOnExec)
 import Hyperion.Util                 (myExecutable, tryLogException)
 import System.CPUTime                (getCPUTime)
@@ -87,8 +89,9 @@ import System.Exit                   (ExitCode (..))
 import System.Process                (createProcess, proc, terminateProcess,
                                       waitForProcess)
 
--- | The master's handle on a node's supervisor.
-newtype NodeSupervisor = NodeSupervisor ProcessId
+-- | The master's handle on a node's supervisor: its process, and the local
+-- process launching it.
+data NodeSupervisor = NodeSupervisor ProcessId ProcessId
 
 type Reply = Either String ByteString
 
@@ -108,28 +111,31 @@ data SupervisorMessage
   | StopSupervisor (SendPort ())
   deriving (Generic, Binary)
 
+-- | The supervisor's process.
+nodeSupervisorProcess :: NodeSupervisor -> ProcessId
+nodeSupervisorProcess (NodeSupervisor pid _) = pid
+
 -- | Start the supervisor on the node at the given address, with one CPU slot
--- per log path.
-startNodeSupervisor :: WorkerAddr -> [OsPath] -> Job NodeSupervisor
-startNodeSupervisor addr logPaths = do
+-- per log path. The given seconds, from 'getWorkerConnectSeconds', limit how
+-- long each of its workers may take to connect.
+startNodeSupervisor :: Int -> WorkerAddr -> [OsPath] -> Job NodeSupervisor
+startNodeSupervisor connectSeconds addr logPaths = do
   (startupPort, startupReplies) <- lift newChan
   job <- spawnLocalJob $ remoteEvalOnWorker addr $
-    static supervisorMain `cAp` cPure logPaths `cAp` cPure startupPort
-  pid <- lift $ bracket (monitor job) unmonitor $ \ref -> receiveWait
-    [ matchChan startupReplies pure
-    , matchIf (isDeathOf ref) $ \(ProcessMonitorNotification _ _ reason) ->
-        Log.throwError $ "NodeSupervisor did not start: " <> show reason
-    ]
+    static supervisorMain `cAp` cPure connectSeconds `cAp` cPure logPaths
+      `cAp` cPure startupPort
+  pid <- lift $ awaitServiceStart
+    ("NodeSupervisor on " <> show addr) job startupReplies
   Log.info "Started NodeSupervisor" (addr, pid)
-  pure $ NodeSupervisor pid
+  pure $ NodeSupervisor pid job
 
 -- | Stop the supervisor, and wait up to 30 s for it to shut its workers down.
 stopNodeSupervisor :: NodeSupervisor -> Process ()
-stopNodeSupervisor (NodeSupervisor pid) = do
+stopNodeSupervisor (NodeSupervisor pid launching) = do
   (donePort, done) <- newChan
   send pid $ StopSupervisor donePort
   receiveChanTimeout 30_000_000 done >>= \case
-    Just () -> pure ()
+    Just () -> awaitProcessesEnd [launching]
     Nothing -> Log.warn "NodeSupervisor did not stop in time" pid
 
 -- | Run the closure on a fresh worker of the given CPU slot. Throws if the
@@ -138,7 +144,7 @@ stopNodeSupervisor (NodeSupervisor pid) = do
 runOnNodeSupervisor
   :: NodeSupervisor -> Int -> Closure (Process ByteString)
   -> Process ByteString
-runOnNodeSupervisor (NodeSupervisor pid) slot closure = do
+runOnNodeSupervisor (NodeSupervisor pid _) slot closure = do
   (replyPort, replies) <- newChan
   let request = TaskRequest closure replyPort
   reply <- bracket (monitor pid) unmonitor $ \ref -> do
@@ -149,8 +155,8 @@ runOnNodeSupervisor (NodeSupervisor pid) slot closure = do
           pure $ Left $ "NodeSupervisor died: " <> show reason
       ]
     `onException` send pid (CancelTask (requestId request))
-  let failed err =
-        Log.throwError $ "Task failed on slot " <> show slot <> ": " <> err
+  let failed err = Log.throwError $
+        "Task failed on slot " <> show slot <> " of " <> show pid <> ": " <> err
   either failed pure reply
 
 -- * The supervisor
@@ -166,8 +172,8 @@ data SupervisorState = SupervisorState
 
 -- | Run the supervisor, with one CPU slot per log path (the log file of the
 -- slot's workers).
-supervisorMain :: [OsPath] -> SendPort ProcessId -> Process ()
-supervisorMain logPaths startupPort = do
+supervisorMain :: Int -> [OsPath] -> SendPort ProcessId -> Process ()
+supervisorMain connectSeconds logPaths startupPort = do
   -- Its workers would otherwise hold its connection to the master open, so the
   -- master wouldn't notice if it died.
   liftIO closeOpenFdsOnExec
@@ -185,7 +191,7 @@ supervisorMain logPaths startupPort = do
   st <- liftIO $ SupervisorState
     <$> newTVarIO Map.empty <*> newTVarIO Set.empty <*> newTVarIO (0, 0, 0)
   slots <- forM logPaths $ \logPath -> do
-    slotPid <- spawnLocal $ slotLoop st (workerCommand logPath)
+    slotPid <- spawnLocal $ slotLoop connectSeconds st (workerCommand logPath)
     -- A slot that dies would leave its requests unanswered: die with it, so
     -- that the master notices.
     link slotPid
@@ -248,14 +254,14 @@ data ReadyWorker = ReadyWorker (SendPort TaskRequest) (IO ())
 type WorkerCommand = Service -> (OsString, [OsString])
 
 -- | Run requests, one at a time, each on a fresh worker launched in advance.
-slotLoop :: SupervisorState -> WorkerCommand -> Process ()
-slotLoop st workerCommand = do
+slotLoop :: Int -> SupervisorState -> WorkerCommand -> Process ()
+slotLoop connectSeconds st workerCommand = do
   self <- getSelfPid
   hosts <- liftIO $ newIORef Set.empty
   let
     newHost = do
       readyVar <- liftIO newEmptyMVar
-      pid <- spawnLocal $ hostWorker workerCommand readyVar
+      pid <- spawnLocal $ hostWorker connectSeconds workerCommand readyVar
       liftIO $ modifyIORef' hosts (Set.insert pid)
       pure (pid, readyVar)
     forgetHost pid = liftIO $ modifyIORef' hosts (Set.delete pid)
@@ -327,8 +333,8 @@ slotLoop st workerCommand = do
 
 -- | Launch a worker, start its task receiver, pass the worker to the slot,
 -- and shut it down when the slot releases it.
-hostWorker :: WorkerCommand -> MVar (Either String ReadyWorker) -> Process ()
-hostWorker workerCommand readyVar = do
+hostWorker :: Int -> WorkerCommand -> MVar (Either String ReadyWorker) -> Process ()
+hostWorker connectSeconds workerCommand readyVar = do
   starting <- liftIO $ newIORef Nothing
   released <- liftIO newEmptyMVar
   let
@@ -355,7 +361,7 @@ hostWorker workerCommand readyVar = do
         writeIORef starting Nothing
         putMVar readyVar $ Right $ ReadyWorker taskPort (putMVar released ())
         takeMVar released
-  result <- try $ withWorker (slotLauncher workerCommand starting) useWorker
+  result <- try $ withWorker (slotLauncher connectSeconds workerCommand starting) useWorker
   case result of
     Right () -> pure ()
     Left (e :: SomeException) ->
@@ -399,8 +405,8 @@ data WorkerExited = WorkerExited ServiceId ExitCode
 -- waiting for a timeout. A worker that dies later is noticed by the slot's
 -- monitor.
 slotLauncher
-  :: WorkerCommand -> IORef (Maybe ServiceId) -> WorkerLauncher ServiceId
-slotLauncher workerCommand starting = WorkerLauncher
+  :: Int -> WorkerCommand -> IORef (Maybe ServiceId) -> WorkerLauncher ServiceId
+slotLauncher connectSeconds workerCommand starting = WorkerLauncher
   { withLaunchedWorker = \_ service go -> do
       let (cmd, args) = workerCommand service
       hostThread <- liftIO myThreadId
@@ -420,7 +426,7 @@ slotLauncher workerCommand starting = WorkerLauncher
         writeIORef terminated True
         terminateProcess handle)
   , overrideToLogPath = Nothing
-  , connectionTimeout = Just 300
+  , connectionTimeout = connectLimit connectSeconds
   , onRemoteError     = \e _ -> throwM e
   , storeCancelAction = emptyStoreCancelAction
   , onServiceExit     = emptyOnServiceExit

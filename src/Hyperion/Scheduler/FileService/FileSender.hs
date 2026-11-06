@@ -23,6 +23,7 @@
 module Hyperion.Scheduler.FileService.FileSender
   ( FileSender
   , FileSenders (..)
+  , fileSenderProcesses
   , FileSenderConfig (..)
   , TimeStamp
   , withFileSenders
@@ -47,7 +48,7 @@ import Control.Distributed.Process.ManagedProcess  (StatelessHandler,
                                                     shutdownHandler,
                                                     statelessInit,
                                                     statelessProcess)
-import Control.Monad                               (forM, forever, when)
+import Control.Monad                               (forever, when)
 import Control.Monad.Catch                         (SomeException, bracket,
                                                     bracket_, catch, finally,
                                                     throwM, try)
@@ -73,6 +74,8 @@ import Hyperion.OsPath                             (OsPath, splitFileName,
 import Hyperion.Scheduler.FileService.RetryTimeout (RetryTimeoutPolicy (..),
                                                     runWithRetryTimeout)
 import Hyperion.Scheduler.RemoteUtil               (Service (..),
+                                                    awaitProcessesEnd,
+                                                    startAllOrNone,
                                                     startRemoteService)
 import Hyperion.Scheduler.TPrioQueue               (TPrioQueue (..))
 import Hyperion.Scheduler.TPrioQueue               qualified as TPrioQueue
@@ -105,18 +108,22 @@ instance Static (Binary FileSenderConfig) where
 
 -- RAII wrapper for starting FileSender on each worker
 withFileSenders :: FileSenderConfig -> [WorkerAddr] -> (FileSenders -> Job a) -> Job a
-withFileSenders config nodes = bracket acquire release where
+withFileSenders config nodes go = bracket acquire release (go . fst) where
 
-  acquire :: Job FileSenders
+  acquire :: Job (FileSenders, [ProcessId])
   acquire = do
-    senders <- forM nodes $ \node -> do
-      sender <- startFileSender config node
-      return (node, sender)
-    return $ FileSenders $ Map.fromList senders
+    senders <- startAllOrNone
+      (\node -> do
+        (sender, launching) <- startFileSender config node
+        return ((node, sender), launching))
+      (\((_, sender), launching) -> lift $ shutdown' sender >> awaitProcessesEnd [launching])
+      nodes
+    return (FileSenders $ Map.fromList $ map fst senders, map snd senders)
 
-  release :: FileSenders -> Job ()
-  release (FileSenders senderMap) = do
+  release :: (FileSenders, [ProcessId]) -> Job ()
+  release (FileSenders senderMap, launching) = do
     mapM_ (lift . shutdown') $ Map.elems senderMap
+    lift $ awaitProcessesEnd launching
 
   shutdown' (FileSender _ pid) = shutdown pid
 
@@ -125,6 +132,11 @@ withFileSenders config nodes = bracket acquire release where
 -- | Simple file sender
 data FileSender = FileSender WorkerAddr ProcessId
   deriving (Generic, Binary, Show)
+
+-- | The senders' processes, named for error messages.
+fileSenderProcesses :: FileSenders -> [(String, ProcessId)]
+fileSenderProcesses (FileSenders senders) =
+  [ ("FileSender on " <> show node, pid) | (node, FileSender _ pid) <- Map.toList senders ]
 
 -- | Copy file from remote sourcePath (on FileSender node) to local destPath (on this node).
 -- Returns number of bytes if successful, Nothing otherwise.
@@ -183,7 +195,7 @@ data Response = FileDoesNotExist | Chunk B.ByteString | EndOfFile | FileSenderEr
 -- Message sent by FileSender upon creation
 type StartupResponse = ProcessId
 
-startFileSender :: FileSenderConfig -> WorkerAddr -> Job FileSender
+startFileSender :: FileSenderConfig -> WorkerAddr -> Job (FileSender, ProcessId)
 startFileSender config node = do
   let
     getClosure startupResponseSendPort =
@@ -192,8 +204,8 @@ startFileSender config node = do
         `cAp` cPure startupResponseSendPort
 
   Log.info "Start remote FileSender" node
-  pid <- startRemoteService @FileSender node getClosure
-  return $ FileSender node pid
+  (pid, launching) <- startRemoteService @FileSender "FileSender" node getClosure
+  return (FileSender node pid, launching)
 
 -- Shortcut for atomic modifyTVar'
 updateTVar :: TVar a -> (a -> a) -> Process ()
