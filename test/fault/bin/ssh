@@ -1,0 +1,3 @@
+#!/bin/bash
+# Stands in for ssh to a pretend node: runs the last argument here, with this environment.
+exec sh -c "${!#}"

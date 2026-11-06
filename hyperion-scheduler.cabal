@@ -131,6 +131,7 @@ executable hyperion-scheduler-test
     , matrix
     , mtl
     , optparse-applicative
+    , process
     , vector
   default-language: GHC2021
 

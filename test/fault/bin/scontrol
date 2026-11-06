@@ -1,0 +1,3 @@
+#!/bin/bash
+# Stands in for `scontrol show hostnames`: the pretend nodes of FAULT_NODES, one per line.
+tr ' ,' '\n\n' <<< "$FAULT_NODES"

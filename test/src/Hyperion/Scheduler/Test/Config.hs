@@ -30,7 +30,7 @@ import System.Environment        (getEnv)
 
 -- | An HPC cluster we know how to run on. Add a constructor (and fill in the
 -- case split below) to support a new cluster.
-data Site = Expanse
+data Site = Expanse | LocalSlurm
   deriving (Eq, Ord, Show, Enum, Bounded, Generic, Binary)
 
 instance Static (Binary Site) where
@@ -38,7 +38,8 @@ instance Static (Binary Site) where
 
 siteName :: Site -> String
 siteName = \case
-  Expanse -> "expanse"
+  Expanse    -> "expanse"
+  LocalSlurm -> "local-slurm"
 
 allSites :: [Site]
 allSites = [minBound .. maxBound]
@@ -62,6 +63,8 @@ hyperionStaticConfig = \case
     { hostNameStrategy           = GetHostEntriesExternal
     , nodeLauncherTimeoutRetries = Just (10, 5)
     }
+  LocalSlurm -> defaultHyperionStaticConfig
+    { nodeLauncherTimeoutRetries = Just (30, 2) }
 
 -- | Default base directory, used when @--base-dir@ is not given.
 getScratchDir :: Site -> IO OsPath
@@ -69,6 +72,8 @@ getScratchDir = \case
   Expanse -> do
     user <- getEnv "USER"
     pure $ "/expanse/lustre/scratch" </> fromString user </> "temp_project/hyperion-scheduler/test"
+  -- A fault test always passes @--base-dir@.
+  LocalSlurm -> pure "tmp/hyperion-scheduler-local-slurm-test"
 
 -- | Site defaults for @sbatch@. Anything given on the command line wins; see
 -- 'withSiteDefaults'.
@@ -78,6 +83,7 @@ siteSbatchOptions = \case
     { partition = Just "compute"
     , account   = Just "yun124"
     }
+  LocalSlurm -> Slurm.defaultSbatchOptions
 
 -- | Fill in the optional @sbatch@ settings the user did not specify. Fields
 -- that always have a value ('nodes', 'nTasksPerNode', 'time', ...) are taken
@@ -119,6 +125,16 @@ getSchedulerConfig = \case
       , nodeLocalStorageSize = 900 * 1000 * 1000 * 1000
       , localStoragePath     = localStoragePath
       , reportInterval       = 10
+      }
+  -- A small allocation on a shared machine, for fault tests: node-local storage
+  -- comes from the environment, since there is no node-local scratch.
+  LocalSlurm -> do
+    localStoragePath <- liftIO $ fromString <$> getEnv "HYPERION_SCHEDULER_TEST_LOCAL_STORAGE"
+    pure Scheduler.MkConfig
+      { nodeMemory           = 8 * 1024 * 1024 * 1024
+      , nodeLocalStorageSize = 1024 * 1024 * 1024
+      , localStoragePath     = localStoragePath
+      , reportInterval       = 5
       }
 
 -- * Local (no SLURM) configuration

@@ -145,6 +145,12 @@ getSite = lookupEnv siteEnvVar >>= \case
   Nothing -> pure TestConfig.defaultSite
   Just s  -> either (die . ((siteEnvVar <> ": ") <>)) pure (TestConfig.parseSite s)
 
+-- | A program to start every worker under, for fault injection (see
+-- @test/fault/README.md@). Workers read it too, so that a node's supervisor
+-- starts its workers the same way.
+workerWrapperEnvVar :: String
+workerWrapperEnvVar = "HYPERION_SCHEDULER_TEST_WORKER_WRAPPER"
+
 -- | Set by @local@ for the worker processes it launches, which must use its
 -- 'HyperionStaticConfig' rather than the site's.
 localWorkersEnvVar :: String
@@ -153,9 +159,14 @@ localWorkersEnvVar = "HYPERION_SCHEDULER_TEST_LOCAL_WORKERS"
 runOnCluster :: Site -> IO ()
 runOnCluster site = do
   isLocalWorker <- (== Just "1") <$> lookupEnv localWorkersEnvVar
-  let staticConfig
+  wrapper <- lookupEnv workerWrapperEnvVar
+  let siteConfig
         | isLocalWorker = defaultHyperionStaticConfig
         | otherwise     = TestConfig.hyperionStaticConfig site
+      staticConfig = case wrapper of
+        Just program | not (null program) -> siteConfig
+          { workerCommand = wrapWorkerCommand (fromString program) [] . siteConfig.workerCommand }
+        _ -> siteConfig
   hyperionMain masterOptsParser mkHyperionConfig staticConfig clusterComputation
   where
     -- Keep runs with different allocations side by side, so their task stats

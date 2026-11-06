@@ -37,7 +37,7 @@ import GHC.Generics              (Generic)
 import Hyperion
 import Hyperion.Log              qualified as Log
 import Hyperion.OsPath           (OsPath, (<.>), (</>))
-import Hyperion.OsString         (showOs)
+import Hyperion.OsString         (fromString, showOs)
 import Hyperion.Scheduler        (IsFileStatKey (..), IsStatKey (..),
                                   MemorySize, PathResolver (..),
                                   ToFileStatKey (..), TotalInputFileSize (..),
@@ -49,7 +49,10 @@ import Hyperion.Scheduler.Task   (ComputeValue (..), DepKeys, FetchesKey,
                                   ReadValue, SaveValue, TaskKey (..),
                                   TaskKind (..), ValueType, getPath, mkTaskMap,
                                   readValueM, saveValueM)
-import System.Directory.OsPath   (createDirectoryIfMissing, removePathForcibly)
+import System.Directory.OsPath   (createDirectoryIfMissing, doesPathExist,
+                                  removePathForcibly)
+import System.Environment        (lookupEnv)
+import System.Process            (callProcess)
 
 -- * The problem
 
@@ -194,8 +197,28 @@ vectorElementInputKeys key = map mkKey ks where
 runVectorElementScript :: [(MultiplyKey a, OsPath)] -> (VectorElementKey a, OsPath) -> Process ()
 runVectorElementScript inputs (outputKey, outputPath) = do
   Log.info "runVectorElementScript" (map snd inputs, outputPath)
+  liftIO $ runSlowElement outputKey.layerIndex outputKey.index
   values <- mapM (uncurry readValueM) inputs
   saveValueM outputKey outputPath (sum values)
+
+-- | Fault tests only: with @HYPERION_SCHEDULER_TEST_SLOW_ELEMENT=layer:index:seconds@,
+-- that element's task first runs @sleep seconds@ as an external program, as a
+-- long native computation does: the worker waits and sends nothing meanwhile.
+-- An index of @*@ means all the layer's elements, so that some run on each node.
+-- With @HYPERION_SCHEDULER_TEST_SLOW_ELEMENT_DONE=file@ it stops once that file
+-- exists and writes it when it has run, so that a later pass or retry is quick.
+runSlowElement :: Int -> Int -> IO ()
+runSlowElement layer index = lookupEnv "HYPERION_SCHEDULER_TEST_SLOW_ELEMENT" >>= \spec ->
+  case words . map (\c -> if c == ':' then ' ' else c) <$> spec of
+    Just [l, i, seconds] | read l == layer, i == "*" || read i == index ->
+      lookupEnv "HYPERION_SCHEDULER_TEST_SLOW_ELEMENT_DONE" >>= \done -> case done of
+        Nothing   -> callProcess "sleep" [seconds]
+        Just file -> do
+          ran <- doesPathExist (fromString file)
+          unless ran $ do
+            callProcess "sleep" [seconds]
+            writeFile file "ran\n"
+    _ -> pure ()
 
 instance
   ( LinearTransformContext a

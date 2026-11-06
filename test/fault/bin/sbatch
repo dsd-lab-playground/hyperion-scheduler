@@ -1,0 +1,18 @@
+#!/bin/bash
+# Stands in for sbatch inside an allocation: runs the job script here at once, so that hyperion submits nothing.
+set -u
+script=$(cat)
+chdir=$PWD output=/dev/null
+while (($#)); do
+  case $1 in
+    -D) chdir=$2; shift ;;
+    --output) output=$2; shift ;;
+  esac
+  shift
+done
+mkdir -p "$chdir"
+file=$(mktemp "$chdir/job.XXXXXX")
+printf '%s\n' "$script" > "$file"
+# All three fds redirected: hyperion waits for its sbatch call to close them.
+setsid nohup sh "$file" > "$output" 2>&1 < /dev/null &
+echo "Submitted batch job ${SLURM_JOB_ID:-1}"
