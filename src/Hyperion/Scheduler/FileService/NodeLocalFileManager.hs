@@ -51,9 +51,11 @@ import Control.Concurrent.STM                      (STM, TQueue, TVar,
                                                     newTVarIO, readTQueue,
                                                     readTVar, readTVarIO, retry,
                                                     writeTQueue, writeTVar)
-import Control.Distributed.Process                 (ProcessId, SendPort,
-                                                    getSelfNode, getSelfPid,
-                                                    link, newChan, receiveChan,
+import Control.Distributed.Process                 (ProcessId,
+                                                    ProcessLinkException (..),
+                                                    SendPort, getSelfNode,
+                                                    getSelfPid, link, newChan,
+                                                    processNodeId, receiveChan,
                                                     sendChan, spawnLocal,
                                                     unlink)
 import Control.Distributed.Process.Async           (AsyncResult (..),
@@ -70,8 +72,8 @@ import Control.Distributed.Process.ManagedProcess  (StatelessHandler,
 import Control.Monad                               (filterM, forM, forever,
                                                     guard, when)
 import Control.Monad.Catch                         (SomeException, bracket,
-                                                    bracket_, finally, try,
-                                                    tryJust)
+                                                    bracket_, catch, finally,
+                                                    try, tryJust)
 import Control.Monad.IO.Class                      (MonadIO, liftIO)
 import Control.Monad.Trans                         (lift)
 import Data.Binary                                 (Binary)
@@ -1133,7 +1135,13 @@ downloadNodeLoop fileSender config activeDownloadRequestsVar queue = do
 
     doDownload :: TimeStamp -> String -> OsPath -> TWorkerPool -> TVar (Maybe DownloadFileResult) -> Process ()
     doDownload timeStamp description filePath workerPool resVar = do
-      res <- withAnyWorker workerPool $ downloadOnWorker timeStamp description filePath
+      -- A dead ReusableWorker reaches us through the link in withAnyWorker. The waiter on resVar has no other way
+      -- to learn of it, so answer with DownloadError: without this the fetch is never answered and the run hangs silently.
+      res <- withAnyWorker workerPool (downloadOnWorker timeStamp description filePath)
+        `catch` \(ProcessLinkException pid reason) -> do
+          Log.err $ description <> " failed: linked process " <> show pid <> " on " <> show (processNodeId pid)
+            <> " was lost (a ReusableWorker, unless the run is already shutting down): " <> show reason
+          pure DownloadError
       liftIO $ atomically $ writeTVar resVar $ Just res
 
     checkIsLess countVar maybeMaxCount = case maybeMaxCount of
