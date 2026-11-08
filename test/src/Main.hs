@@ -41,9 +41,10 @@ import Hyperion.Slurm                          (SbatchOptions (..),
                                                 sBatchOptionsParser)
 import Options.Applicative                     (Parser, ParserInfo, auto,
                                                 execParser, fullDesc, help,
-                                                helper, info, long, metavar,
-                                                option, optional, progDesc, str,
-                                                switch, value, (<**>))
+                                                helper, info, long, many,
+                                                metavar, option, optional,
+                                                progDesc, str, switch, value,
+                                                (<**>))
 import System.Console.Concurrent               (withConcurrentOutput)
 import System.Directory.OsPath                 (createDirectoryIfMissing,
                                                 makeAbsolute)
@@ -73,6 +74,10 @@ problemOptsParser = do
     <> help "Stage the executable on node-local disk and launch workers from the copy"
   taskEnvironment <- switch $ long "task-environment"
     <> help "Launch workers with the default task environment"
+  stagedPrograms <- many $ option (fromString <$> str) $ long "stage-program" <> metavar "FILE"
+    <> help "A program to stage besides the executable"
+  stagingTimeout <- optional $ option auto $ long "staging-timeout" <> metavar "SECONDS"
+    <> help "How long the master waits for nodes to stage"
   pure ProblemOptions{launch = LaunchOptions{..}, ..}
 
 toProblem :: ProblemOptions -> CyclicShiftProblem

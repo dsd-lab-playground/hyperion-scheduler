@@ -111,6 +111,7 @@ import Hyperion.Scheduler.Types                     (Estimate (..),
                                                      schedulingEstimate)
 import Hyperion.Scheduler.WorkerPool                (TWorker (workerId),
                                                      WorkerPool,
+                                                     checkTaskLaunch,
                                                      toReusableWorker,
                                                      withWorkerPool,
                                                      withWorkersFromPool,
@@ -575,6 +576,7 @@ runTaskMap config taskMap = do
     taskGraph = TaskGraph.fromEdges taskMap
     cleanupDependencies = buildCleanupDependenciesMap config taskMap
   either Log.throw pure $ validateNodeLocalInputs config taskMap
+  checkTaskLaunch config.taskLaunch
   nodes <- getJobNodes config
   reportBeforeRun config nodes taskMap
   withFileService config nodes $ \fileService -> withWorkerPool config.taskLaunch nodes $ \workerPool -> do

@@ -45,23 +45,56 @@ master does nothing more per task.
   the system folders, into `staging.directory` on node-local disk, removes
   the copies' `RPATH`s, and checks with the loader that each copy loads the
   libraries the original loaded. The folder is named by a hash of every
-  source file, so a second run in the same job reuses it, and the master
-  checks that all nodes staged the same files. Workers start from the copy,
-  with the staged `bin` and `lib` first in `PATH` and `LD_LIBRARY_PATH`, so a
-  task finds a staged program by its name.
+  source file, and the master checks that all nodes staged the same files.
+  Workers start from the copy, with the staged `bin` and `lib` first in `PATH`
+  and `LD_LIBRARY_PATH`, so a task finds a staged program by its name.
 
 Why: on Expanse a process that starts while 31 others start too spends ~77
 ms in the kernel when `/cm/shared` (CephFS) folders are on its library path,
 whether from the module environment or from an `RPATH`, against 0.7 ms with
-node-local folders only; and OpenBLAS starts one thread per core in every
-worker unless told otherwise. A generation that starts several processes per
-task spent most of its time there (bootstrap-compute #343).
+node-local folders only, which takes `SetEnvironment` as well: with
+`InheritEnvironment` the inherited folders stay on the path, after the staged
+ones, and system libraries are still searched for there. And OpenBLAS starts
+one thread per core in every worker unless told otherwise. A generation that starts several processes per
+task spent most of its time there (bootstrap-compute #343). The gain is for
+computations of many small tasks: it was large on the O(2) toy and at nmax 6,
+and the same switches gave 1.033x at Ising+T nmax 14 (bootstrap-compute #364).
+
+A later `runTasks` in the same job reuses the staged folder. If the sources'
+paths, sizes, modification and status change times, devices and inodes are
+unchanged, no source is read, and only the sizes of the staged files are
+checked, so a same-size change of a staged file isn't seen then. Otherwise
+every source is hashed, and the staged files' hashes are checked. How each node
+came to its set, and how long that took, is in the master's log (`Started
+NodeSupervisor`). The loader's check runs every time.
 
 Both need supervisors: with `HYPERION_SCHEDULER_NODE_SUPERVISORS=0` a
-non-default `taskLaunch` is an error at start. A path is node-local exactly
-when it is under `localStoragePath`; don't reach node-local files through a
-symbolic link on a network filesystem, since every `open` resolves the link
-there.
+non-default `taskLaunch` is an error at start. If a node can't prepare, or the
+nodes staged different files, or a node hasn't replied within
+`staging.startupTimeout`, the master stops the supervisors that started, ends
+those still starting, and the run ends before any task runs, with an error that
+names each node's failure.
+
+What the check doesn't cover:
+
+- A program's `launcherLibraryPath` is what its launcher (e.g. a script) puts
+  first in `LD_LIBRARY_PATH`; the scheduler doesn't apply it. Started by its bare
+  name without those folders, the program loads the staged library of the same
+  name, if there is one, and nothing reports it.
+- Programs that aren't listed run with the staged `lib` first in
+  `LD_LIBRARY_PATH`. One with a `RUNPATH`, which comes after `LD_LIBRARY_PATH`,
+  loads a staged library of the same name instead of its own. List every program
+  that tasks start.
+- Libraries opened with `dlopen`, which removing an `RPATH` can hide.
+- Programs that find files next to themselves (through `$0` or
+  `/proc/self/exe`): only what is listed is next to a staged copy.
+- Processes that hyperion starts rather than a supervisor (the master, file
+  services, the reusable workers that fetch files): they start once each, from
+  shared storage, with the old environment.
+
+A path is node-local exactly when it is under `localStoragePath`; don't reach
+node-local files through a symbolic link on a network filesystem, since every
+`open` resolves the link there.
 
 ## Building
 
@@ -74,8 +107,10 @@ stack build
 ### Unit tests
 
 Tests for task maps (validation, replacement, placeholders, input sizes),
-statistics and estimates, and input summaries. No cluster; only the `TaskFiles`
-test touches the filesystem, in a temporary directory:
+statistics and estimates, input summaries, and task launch. No cluster. Those
+that touch the filesystem do it in a temporary directory. The staging test runs
+the system's dynamic loader on its own executable, and needs that executable to
+load GMP or another of the libraries it lists (it stops with an error if not):
 
 ```sh
 stack test

@@ -14,5 +14,5 @@ data Config = MkConfig
     -- | How node supervisors launch task workers: environment and node-local
     -- executables. 'Hyperion.Scheduler.TaskLaunch.defaultTaskLaunch' is the
     -- behaviour from before the field existed.
-  , taskLaunch           :: TaskLaunch
+  , taskLaunch           :: !TaskLaunch
   }

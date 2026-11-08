@@ -86,6 +86,7 @@ library
     , file-io
     , hyperion
     , hyperion-util
+    , memory
     , min-max-pqueue
     , monoidal-containers
     , mtl
@@ -172,6 +173,7 @@ test-suite hyperion-scheduler-unit-test
     , hyperion
     , hyperion-scheduler
     , hyperion-util
+    , mtl
     , store
     , text
     , time

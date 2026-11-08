@@ -23,9 +23,11 @@ import Hyperion.OsPath           (OsPath, (</>))
 import Hyperion.OsString         (fromString)
 import Hyperion.Scheduler.Config qualified as Scheduler
 import Hyperion.Scheduler.TaskLaunch (EnvironmentPolicy (..),
-                                      ExecutablePolicy (..), TaskLaunch (..),
-                                      defaultStaging, defaultTaskEnvironment,
-                                      defaultTaskLaunch)
+                                      ExecutablePolicy (..), Seconds (..),
+                                      Staging (..), TaskLaunch (..),
+                                      defaultStaging, defaultStartupTimeout,
+                                      defaultTaskEnvironment, defaultTaskLaunch,
+                                      program)
 import Hyperion.Slurm            (SbatchOptions (..))
 import Hyperion.Slurm            qualified as Slurm
 import System.Environment        (getEnv)
@@ -149,6 +151,11 @@ data LaunchOptions = LaunchOptions
     nodeLocalExecutables :: Bool
     -- | Launch workers with 'defaultTaskEnvironment'.
   , taskEnvironment      :: Bool
+    -- | Programs to stage besides the executable. Failure tests name a missing
+    -- file, or one whose reading blocks.
+  , stagedPrograms       :: [OsPath]
+    -- | The staging start-up timeout, in seconds, if not the default.
+  , stagingTimeout       :: Maybe Int
   }
   deriving (Eq, Show, Generic, Binary)
 
@@ -163,5 +170,8 @@ testTaskLaunch opts stagingDir = defaultTaskLaunch
       else InheritEnvironment
   , executables = if opts.nodeLocalExecutables
       then NodeLocalExecutables (defaultStaging stagingDir)
+        { programs = map program opts.stagedPrograms
+        , startupTimeout = maybe defaultStartupTimeout Seconds opts.stagingTimeout
+        }
       else SharedExecutables
   }

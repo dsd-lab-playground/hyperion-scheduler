@@ -34,6 +34,8 @@
 -- reply, and the master stops before any task runs.
 module Hyperion.Scheduler.NodeSupervisor
   ( NodeSupervisor
+  , NodeSlots (..)
+  , StartedSupervisor (..)
   , startNodeSupervisors
   , stopNodeSupervisor
   , runOnNodeSupervisor
@@ -46,7 +48,7 @@ import Control.Concurrent.MVar       (MVar, newEmptyMVar, putMVar, takeMVar,
                                       tryPutMVar)
 import Control.Concurrent.STM        (TVar, atomically, modifyTVar', newTVarIO,
                                       readTVar, readTVarIO)
-import Control.Distributed.Process   (DidSpawn (..), MonitorRef, Process,
+import Control.Distributed.Process   (DiedReason, DidSpawn (..), MonitorRef, Process,
                                       ProcessId,
                                       ProcessMonitorNotification (..),
                                       ReceivePort, SendPort, SendPortId,
@@ -59,7 +61,7 @@ import Control.Distributed.Process   (DidSpawn (..), MonitorRef, Process,
                                       unClosure, unlink, unmonitor)
 import Control.Exception             (Exception, SomeException)
 import Control.Monad                 (forM, forM_, forever, join, replicateM_,
-                                      void, when)
+                                      unless, void, when)
 import Control.Monad.Catch           (bracket, onException, throwM, try)
 import Control.Monad.Extra           (unlessM, whenM)
 import Control.Monad.Trans           (lift)
@@ -86,9 +88,10 @@ import Hyperion.Log                  qualified as Log
 import Hyperion.OsPath               (OsPath)
 import Hyperion.OsString             (OsString, toString)
 import Hyperion.Scheduler.RemoteUtil (spawnLocalJob)
-import Hyperion.Scheduler.TaskLaunch (NodeLaunch (..), StagingError,
-                                      StagingSummary, TaskLaunch,
-                                      prepareNodeLaunch)
+import Hyperion.Scheduler.TaskLaunch (NodeLaunch (..), NodeTaskLaunch (..),
+                                      Seconds (..), StagingError, StagingReport,
+                                      StartupWaits (..), TaskLaunch (..),
+                                      prepareNodeLaunch, startupTimeoutOf)
 import Hyperion.Util                 (myExecutable, tryLogException)
 import System.CPUTime                (getCPUTime)
 import System.Exit                   (ExitCode (..))
@@ -97,6 +100,7 @@ import System.Process                (CreateProcess (..), createProcess,
 
 -- | The master's handle on a node's supervisor.
 newtype NodeSupervisor = NodeSupervisor ProcessId
+  deriving (Show)
 
 type Reply = Either String ByteString
 
@@ -118,39 +122,114 @@ data SupervisorMessage
 
 -- | The supervisor's start-up reply.
 data StartupReply
-  = Started ProcessId (Maybe StagingSummary)  -- ^ with what it staged, if anything
+  = Started ProcessId (Maybe StagingReport)  -- ^ with what it staged, if anything
   | CannotLaunchTasks StagingError
   deriving (Generic, Binary)
 
--- | Start a supervisor on each node at the given address, with one CPU slot
--- per log path, all at once, and wait until each has replied. Throws if one
--- fails. Returns each supervisor with what it staged, if anything.
-startNodeSupervisors
-  :: TaskLaunch -> [(WorkerAddr, [OsPath])]
-  -> Job [(NodeSupervisor, Maybe StagingSummary)]
-startNodeSupervisors launch nodes = do
-  starting <- forM nodes $ \(addr, logPaths) -> do
-    (startupPort, startupReplies) <- lift newChan
-    job <- spawnLocalJob $ remoteEvalOnWorker addr $
-      static supervisorMain `cAp` cPure launch `cAp` cPure logPaths
-        `cAp` cPure startupPort
-    pure (addr, job, startupReplies)
-  forM starting $ \(addr, job, startupReplies) -> do
-    reply <- lift $ awaitStartup job startupReplies
-    case reply of
-      CannotLaunchTasks err -> Log.throwError $
-        "NodeSupervisor on " <> show addr <> " could not prepare task launch: " <> show err
-      Started pid staged -> do
-        Log.info "Started NodeSupervisor" (addr, pid)
-        pure (NodeSupervisor pid, staged)
+-- | A node to start a supervisor on, with the log file of each CPU slot's
+-- workers.
+data NodeSlots = NodeSlots
+  { address  :: WorkerAddr
+  , logPaths :: [OsPath]
+  }
 
-awaitStartup :: ProcessId -> ReceivePort StartupReply -> Process StartupReply
-awaitStartup job startupReplies =
-  bracket (monitor job) unmonitor $ \ref -> receiveWait
-    [ matchChan startupReplies pure
-    , matchIf (isDeathOf ref) $ \(ProcessMonitorNotification _ _ reason) ->
-        Log.throwError $ "NodeSupervisor did not start: " <> show reason
-    ]
+-- | A supervisor that has replied that it started.
+data StartedSupervisor = StartedSupervisor
+  { address    :: WorkerAddr
+  , supervisor :: NodeSupervisor
+  , staging    :: Maybe StagingReport
+  }
+
+-- | A supervisor that has been spawned and hasn't replied yet.
+data StartingSupervisor = StartingSupervisor
+  { address :: WorkerAddr
+  , job     :: ProcessId
+  , death   :: MonitorRef  -- ^ of the job, from when it was spawned
+  , replies :: ReceivePort StartupReply
+  }
+
+-- | Why a node has no supervisor.
+data StartupFailure
+  = CouldNotPrepare WorkerAddr StagingError
+  | SupervisorDied WorkerAddr DiedReason
+  | NoReplyBeforeDeadline WorkerAddr
+  deriving (Show)
+
+-- | A reading of the monotonic clock.
+newtype Deadline = Deadline Double
+  deriving (Eq, Ord)
+
+deadlineAfter :: Seconds -> IO Deadline
+deadlineAfter (Seconds n) = Deadline . (+ fromIntegral n) <$> getMonotonicTime
+
+-- | Start a supervisor on each node, all at once, and wait for all to reply.
+-- If any fails, stops those that started, ends those that haven't replied, and
+-- throws, naming every failure. Returns one for each node, in order.
+startNodeSupervisors :: NodeTaskLaunch -> [NodeSlots] -> Job [StartedSupervisor]
+startNodeSupervisors launch nodes = do
+  starting <- forM nodes $ \node -> do
+    (startupPort, startupReplies) <- lift newChan
+    job <- spawnLocalJob $ remoteEvalOnWorker node.address $
+      static supervisorMain `cAp` cPure launch `cAp` cPure node.logPaths
+        `cAp` cPure startupPort
+    death <- lift $ monitor job
+    pure $ StartingSupervisor node.address job death startupReplies
+  deadline <- liftIO $ traverse deadlineAfter (startupTimeoutOf launch.launch)
+  let
+    -- Ending the job that evaluates the supervisor shuts its worker down, even
+    -- if it is still preparing and replies later to no one.
+    endIfStarting s = kill s.job "the run's start failed"
+  replies <- lift $
+    awaitStartups launch.launch.startupWaits deadline starting
+      `onException` mapM_ endIfStarting starting
+  lift $ mapM_ (\s -> unmonitor s.death) starting
+  let
+    failures = [ f | Left f <- replies ]
+    started = [ s | Right s <- replies ]
+  unless (null failures) $ do
+    lift $ forM_ (zip starting replies) $ \(s, reply) -> case reply of
+      Left _     -> endIfStarting s
+      Right node -> stopNodeSupervisor node.supervisor
+    Log.throwError $ "Could not start node supervisors: " <> show failures
+  forM_ started $ \s -> Log.info "Started NodeSupervisor" (s.address, s.supervisor, s.staging)
+  pure started
+
+-- | Every supervisor's reply, in order, as they come. After a failure, the
+-- others have 'afterFailure' from then.
+awaitStartups
+  :: StartupWaits -> Maybe Deadline -> [StartingSupervisor]
+  -> Process [Either StartupFailure StartedSupervisor]
+awaitStartups waits firstDeadline starting = do
+  replies <- go firstDeadline starting Map.empty
+  pure [ Map.findWithDefault (Left (NoReplyBeforeDeadline s.address)) s.address replies | s <- starting ]
+  where
+    go _ [] replies = pure replies
+    go deadline pending replies = receiveBefore deadline (concatMap matches pending) >>= \case
+      Nothing -> pure replies
+      Just (addr, reply) -> do
+        deadline' <- case reply of
+          Right _ -> pure deadline
+          Left _ -> do
+            afterFailure <- liftIO $ deadlineAfter waits.afterFailure
+            pure $ Just $ maybe afterFailure (min afterFailure) deadline
+        go deadline' (filter (\s -> s.address /= addr) pending) (Map.insert addr reply replies)
+    matches s =
+      [ matchChan s.replies (pure . (,) s.address . fromReply s)
+      , matchIf (isDeathOf s.death) $ \(ProcessMonitorNotification _ _ reason) ->
+          receiveChanTimeout (microseconds waits.replyAfterDeath) s.replies >>= \case
+            Just reply -> pure (s.address, fromReply s reply)
+            Nothing    -> pure (s.address, Left (SupervisorDied s.address reason))
+      ]
+    fromReply s = \case
+      Started pid staged  -> Right $ StartedSupervisor s.address (NodeSupervisor pid) staged
+      CannotLaunchTasks e -> Left $ CouldNotPrepare s.address e
+    receiveBefore Nothing ms = Just <$> receiveWait ms
+    receiveBefore (Just (Deadline d)) ms = do
+      now <- liftIO getMonotonicTime
+      receiveTimeout (max 0 (ceiling ((d - now) * 1e6))) ms
+
+microseconds :: Seconds -> Int
+microseconds (Seconds n) = n * 1_000_000
 
 -- | Stop the supervisor, and wait up to 30 s for it to shut its workers down.
 stopNodeSupervisor :: NodeSupervisor -> Process ()
@@ -195,7 +274,7 @@ data SupervisorState = SupervisorState
 
 -- | Run the supervisor, with one CPU slot per log path (the log file of the
 -- slot's workers).
-supervisorMain :: TaskLaunch -> [OsPath] -> SendPort StartupReply -> Process ()
+supervisorMain :: NodeTaskLaunch -> [OsPath] -> SendPort StartupReply -> Process ()
 supervisorMain launch logPaths startupPort = do
   -- In local mode the supervisor shares the master's process.
   selfNode <- getSelfNode
@@ -207,7 +286,7 @@ supervisorMain launch logPaths startupPort = do
       Log.warn "NodeSupervisor could not prepare task launch" err
       sendChan startupPort (CannotLaunchTasks err)
     Right nodeLaunch -> do
-      forM_ nodeLaunch.stagingSummary $ Log.info "NodeSupervisor staged programs"
+      forM_ nodeLaunch.stagingReport $ Log.info "NodeSupervisor staged programs"
       supervise nodeLaunch logPaths startupPort
 
 supervise :: NodeLaunch -> [OsPath] -> SendPort StartupReply -> Process ()
@@ -231,7 +310,7 @@ supervise nodeLaunch logPaths startupPort = do
     pure slotPid
   let slotMap = Map.fromList (zip [0 ..] slots)
   self <- getSelfPid
-  sendChan startupPort (Started self nodeLaunch.stagingSummary)
+  sendChan startupPort (Started self nodeLaunch.stagingReport)
   let
     loop = receiveWait [match handle]
     handle = \case

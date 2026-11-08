@@ -24,19 +24,25 @@ module Hyperion.Scheduler.TaskLaunch.Environment
   , ThreadCount (..)
   , oneThreadEach
   , EnvironmentError (..)
+  , ProgramStaging (..)
   , validateTaskEnvironment
+  , validSearchPathEntry
   , StagedDirectories (..)
   , renderEnvironment
   , searchPathOf
   , renderSearchPath
   , parseSearchPath
+  , envKey
+  , pathVar
+  , libraryPathVar
   ) where
 
 import Data.Binary       (Binary)
 import Data.List         (intercalate)
+import Data.List.Extra   (splitOn)
 import Data.Map.Strict   (Map)
 import Data.Map.Strict   qualified as Map
-import Data.Maybe        (catMaybes, mapMaybe)
+import Data.Maybe        (catMaybes)
 import Data.Set          (Set)
 import Data.Set          qualified as Set
 import Data.String       (IsString (..))
@@ -102,7 +108,8 @@ data TaskEnvironment = MkTaskEnvironment
     inherited   :: Inheritance
     -- | Set or overridden after inheriting. Default empty.
   , variables   :: Map EnvName EnvValue
-    -- | @PATH@, after the staged programs' directory if there is one.
+    -- | @PATH@, after the staged programs' directory if there is one; unset if
+    -- that leaves nothing (an empty @PATH@ would mean the current folder).
     -- Default @[\/usr\/bin, \/bin]@: no folder on a network filesystem, where
     -- every command lookup is a metadata request.
   , searchPath  :: [OsPath]
@@ -127,7 +134,7 @@ defaultTaskEnvironment = MkTaskEnvironment
 data EnvironmentError
   = InvalidName EnvName
   | ReservedName EnvName          -- ^ set through a typed field instead
-  | InvalidSearchPathEntry OsPath -- ^ empty, relative, or containing ':'
+  | InvalidSearchPathEntry OsPath -- ^ see 'validSearchPathEntry'
   | InvalidThreadCount ThreadCount
   | StagedDirectoryWithoutStaging EnvName
   deriving stock (Eq, Show, Generic)
@@ -144,15 +151,19 @@ openMPVars = ["OMP_NUM_THREADS"]
 reservedNames :: Set EnvName
 reservedNames = Set.fromList $ [pathVar, libraryPathVar] <> blasVars <> openMPVars
 
--- | All errors of the environment; the 'Bool' says whether programs are
--- staged (needed by 'StagedProgramsDirectory').
-validateTaskEnvironment :: Bool -> TaskEnvironment -> [EnvironmentError]
-validateTaskEnvironment staged env = concat
+-- | Whether programs are staged, which 'StagedProgramsDirectory' needs.
+data ProgramStaging = ProgramsStaged | ProgramsInPlace
+  deriving stock (Eq, Show)
+
+-- | All errors of the environment.
+validateTaskEnvironment :: ProgramStaging -> TaskEnvironment -> [EnvironmentError]
+validateTaskEnvironment staging env = concat
   [ [ InvalidName n | n <- names, not (validName n) ]
   , [ ReservedName n | n <- Map.keys env.variables, n `Set.member` reservedNames ]
-  , [ InvalidSearchPathEntry p | p <- env.searchPath <> env.libraryPath, not (validEntry p) ]
+  , [ InvalidSearchPathEntry p | p <- env.searchPath <> env.libraryPath, not (validSearchPathEntry p) ]
   , [ InvalidThreadCount c | c@(ThreadCount k) <- threadCounts, k < 1 ]
-  , [ StagedDirectoryWithoutStaging n | not staged, (n, StagedProgramsDirectory) <- Map.toList env.variables ]
+  , [ StagedDirectoryWithoutStaging n
+    | staging == ProgramsInPlace, (n, StagedProgramsDirectory) <- Map.toList env.variables ]
   ]
   where
     names = Map.keys env.variables <> case env.inherited of
@@ -160,9 +171,13 @@ validateTaskEnvironment staged env = concat
       InheritOnly keep -> Set.toList keep
     threadCounts = catMaybes [env.threads.blasThreads, env.threads.openMPThreads]
     validName (EnvName s) = not (null s) && all (`notElem` ['=', '\0']) s
-    validEntry p = case OsString.toString p of
-      '/' : rest -> all (`notElem` [':', '\0']) rest
-      _          -> False
+
+-- | An entry of @PATH@ or @LD_LIBRARY_PATH@: absolute, and without the
+-- characters that would split it (the loader splits on @;@ as well as @:@).
+validSearchPathEntry :: OsPath -> Bool
+validSearchPathEntry p = case OsString.toString p of
+  '/' : rest -> all (`notElem` [':', ';', '\0']) rest
+  _          -> False
 
 -- | Where a node's staged programs and libraries are.
 data StagedDirectories = StagedDirectories
@@ -188,24 +203,26 @@ renderEnvironment Nothing (Just staged) own = Just $ Map.toList $
   Map.fromList own
   where
     lookupOwn n = lookup (envKey n) own
-    prepend dir = maybe (OsString.toString dir) (\rest -> OsString.toString dir <> ":" <> rest)
+    -- Without the inherited value's empty entries: an empty entry means the
+    -- current folder, for the loader too, and the check wouldn't see it.
+    prepend dir = renderSearchPath . (dir :) . maybe [] parseSearchPath
 renderEnvironment (Just env) mStaged own = Just $ Map.toList $
   -- The typed search paths replace the inherited ones; inherited thread
   -- variables stay unless a limit is set.
-  Map.union explicit (Map.withoutKeys kept (Set.fromList (map envKey' [pathVar, libraryPathVar])))
+  Map.union explicit (Map.withoutKeys kept (Set.fromList (map envKey [pathVar, libraryPathVar])))
   where
-    envKey' (EnvName s) = s
     kept = Map.fromList $ case env.inherited of
       InheritAll       -> own
-      InheritOnly keep -> filter ((`Set.member` Set.map envKey' keep) . fst) own
+      InheritOnly keep -> filter ((`Set.member` Set.map envKey keep) . fst) own
     stagedBin = (.binDirectory) <$> mStaged
     stagedLib = (.libraryDirectory) <$> mStaged
     value = \case
       EnvText s -> Just s
       StagedProgramsDirectory -> OsString.toString <$> stagedBin
     explicit = Map.fromList $ concat
-      [ [ (envKey' n, v) | (n, ev) <- Map.toList env.variables, Just v <- [value ev] ]
-      , [ (envKey pathVar, renderSearchPath (maybe id (:) stagedBin env.searchPath)) ]
+      [ [ (envKey n, v) | (n, ev) <- Map.toList env.variables, Just v <- [value ev] ]
+      , [ (envKey pathVar, renderSearchPath ps)
+        | let ps = maybe id (:) stagedBin env.searchPath, not (null ps) ]
       , [ (envKey libraryPathVar, renderSearchPath ps)
         | let ps = maybe id (:) stagedLib env.libraryPath, not (null ps) ]
       , threadVars blasVars env.threads.blasThreads
@@ -213,7 +230,7 @@ renderEnvironment (Just env) mStaged own = Just $ Map.toList $
       ]
     threadVars vars = \case
       Nothing -> []
-      Just (ThreadCount k) -> [ (envKey' n, show k) | n <- vars ]
+      Just (ThreadCount k) -> [ (envKey n, show k) | n <- vars ]
 
 envKey :: EnvName -> String
 envKey (EnvName s) = s
@@ -223,13 +240,7 @@ renderSearchPath = intercalate ":" . map OsString.toString
 
 -- | The entries of a @PATH@-like value; empty entries dropped.
 parseSearchPath :: String -> [OsPath]
-parseSearchPath = mapMaybe entry . splitColons
-  where
-    entry "" = Nothing
-    entry s  = Just (OsString.fromString s)
-    splitColons s = case break (== ':') s of
-      (a, [])       -> [a]
-      (a, _ : rest) -> a : splitColons rest
+parseSearchPath = map OsString.fromString . filter (not . null) . splitOn ":"
 
 -- | The entries of a variable of a rendered environment.
 searchPathOf :: EnvName -> [(String, String)] -> [OsPath]

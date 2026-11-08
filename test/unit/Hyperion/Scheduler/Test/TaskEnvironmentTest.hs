@@ -35,24 +35,26 @@ runTest = do
     env = defaultTaskEnvironment
     with vars = env { variables = Map.fromList vars }
     render e s = Map.fromList <$> renderEnvironment e s own
-  expect "the default environment is valid" $ null (validateTaskEnvironment False env)
+  expect "the default environment is valid" $ null (validateTaskEnvironment ProgramsInPlace env)
   expect "PATH is a typed field, not a variable" $
-    validateTaskEnvironment False (with [("PATH", "/x")]) == [ReservedName "PATH"]
+    validateTaskEnvironment ProgramsInPlace (with [("PATH", "/x")]) == [ReservedName "PATH"]
   expect "a thread variable is a typed field" $
-    validateTaskEnvironment False (with [("OMP_NUM_THREADS", "2")]) == [ReservedName "OMP_NUM_THREADS"]
+    validateTaskEnvironment ProgramsInPlace (with [("OMP_NUM_THREADS", "2")]) == [ReservedName "OMP_NUM_THREADS"]
   expect "a name with '=' is invalid" $
-    validateTaskEnvironment False (with [("A=B", "1")]) == [InvalidName "A=B"]
+    validateTaskEnvironment ProgramsInPlace (with [("A=B", "1")]) == [InvalidName "A=B"]
   expect "a relative search path entry is invalid" $
-    validateTaskEnvironment False env { searchPath = ["bin"] } == [InvalidSearchPathEntry "bin"]
+    validateTaskEnvironment ProgramsInPlace env { searchPath = ["bin"] } == [InvalidSearchPathEntry "bin"]
   expect "a search path entry with ':' is invalid" $
-    validateTaskEnvironment False env { libraryPath = ["/a:/b"] } == [InvalidSearchPathEntry "/a:/b"]
+    validateTaskEnvironment ProgramsInPlace env { libraryPath = ["/a:/b"] } == [InvalidSearchPathEntry "/a:/b"]
+  expect "a search path entry with ';' is invalid: the loader splits on it" $
+    validateTaskEnvironment ProgramsInPlace env { libraryPath = ["/a;/b"] } == [InvalidSearchPathEntry "/a;/b"]
   expect "a thread count below 1 is invalid" $
-    validateTaskEnvironment False env { threads = MkThreadLimits (Just (ThreadCount 0)) Nothing }
+    validateTaskEnvironment ProgramsInPlace env { threads = MkThreadLimits (Just (ThreadCount 0)) Nothing }
       == [InvalidThreadCount (ThreadCount 0)]
   expect "the staged directory needs staging" $
-    validateTaskEnvironment False (with [("N", StagedProgramsDirectory)])
+    validateTaskEnvironment ProgramsInPlace (with [("N", StagedProgramsDirectory)])
       == [StagedDirectoryWithoutStaging "N"]
-      && null (validateTaskEnvironment True (with [("N", StagedProgramsDirectory)]))
+      && null (validateTaskEnvironment ProgramsStaged (with [("N", StagedProgramsDirectory)]))
 
   expect "no environment and no staging: inherit unchanged" $
     renderEnvironment Nothing Nothing own == Nothing
@@ -63,6 +65,13 @@ runTest = do
     && (Map.lookup "LD_LIBRARY_PATH" =<< inheritedStaged)
       == Just "/scratch/u/job_42/programs/abc/lib:/cm/shared/apps/gmp/lib"
     && (Map.lookup "OMP_NUM_THREADS" =<< inheritedStaged) == Just "128"
+  let
+    withEmptyEntries = renderEnvironment Nothing (Just dirs)
+      [("PATH", ":/usr/bin"), ("LD_LIBRARY_PATH", "/x::")]
+  expect "inherited with staging: empty entries, which mean the current folder, are dropped" $
+    (Map.toList . Map.fromList <$> withEmptyEntries) == Just
+      [ ("LD_LIBRARY_PATH", "/scratch/u/job_42/programs/abc/lib:/x")
+      , ("PATH", "/scratch/u/job_42/programs/abc/bin:/usr/bin") ]
   let explicit = render (Just (with [("N", StagedProgramsDirectory), ("X", "1")])) (Just dirs)
   expect "explicit with staging: PATH is the staged folder and the system folders" $
     (Map.lookup "PATH" =<< explicit) == Just "/scratch/u/job_42/programs/abc/bin:/usr/bin:/bin"
@@ -80,6 +89,11 @@ runTest = do
   expect "explicit without staging and no library path: no LD_LIBRARY_PATH at all" $
     (Map.member "LD_LIBRARY_PATH" <$> bare) == Just False
     && (Map.lookup "PATH" =<< bare) == Just "/usr/bin:/bin"
+  expect "an empty search path without staging leaves PATH unset: empty would mean the current folder" $
+    (Map.member "PATH" <$> render (Just env { searchPath = [] }) Nothing) == Just False
+  expect "an empty search path with staging is the staged folder" $
+    (Map.lookup "PATH" =<< render (Just env { searchPath = [] }) (Just dirs))
+      == Just "/scratch/u/job_42/programs/abc/bin"
   let only = render (Just env { inherited = InheritOnly (Set.fromList ["HOME"]) }) Nothing
   expect "InheritOnly keeps only the named variables and the typed ones" $
     (Map.keys <$> only) == Just ["GOTO_NUM_THREADS", "HOME", "OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "PATH"]

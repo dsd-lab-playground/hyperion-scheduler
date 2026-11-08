@@ -43,6 +43,7 @@ library:
   - file-io
   - hyperion
   - hyperion-util
+  - memory
   - min-max-pqueue
   - monoidal-containers
   - mtl
@@ -107,6 +108,7 @@ tests:
     - hyperion
     - hyperion-scheduler
     - hyperion-util
+    - mtl
     - store
     - text
     - time

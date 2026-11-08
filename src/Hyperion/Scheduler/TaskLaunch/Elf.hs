@@ -18,13 +18,17 @@
 -- file.
 module Hyperion.Scheduler.TaskLaunch.Elf
   ( ElfError (..)
+  , ElfPart (..)
   , ElfInfo (..)
   , Region (..)
+  , ProgramHeaderTable (..)
   , ProgramHeader (..)
   , elfHeaderSize
   , parseElfHeader
   , parseProgramHeaders
   , segment
+  , DynamicEntry (..)
+  , WithoutRunPaths (..)
   , withoutRunPaths
   , dynamicEntries
   , readElfInfo
@@ -33,6 +37,8 @@ module Hyperion.Scheduler.TaskLaunch.Elf
 
 import Control.Exception      (IOException, try)
 import Control.Monad          (unless, when)
+import Control.Monad.Except   (ExceptT (..), runExceptT, throwError)
+import Control.Monad.IO.Class (liftIO)
 import Data.Bits              (shiftL, shiftR, (.|.))
 import Data.Binary            (Binary)
 import Data.ByteString        (ByteString)
@@ -42,16 +48,26 @@ import Data.Word              (Word16, Word32, Word64)
 import GHC.Generics           (Generic)
 import Hyperion.OsPath        (OsPath)
 import System.File.OsPath     (withBinaryFile)
-import System.IO              (Handle, IOMode (..), SeekMode (..), hSeek)
+import System.IO              (Handle, IOMode (..), SeekMode (..), hFileSize,
+                               hSeek)
+
+-- | A part of an ELF file that can be missing.
+data ElfPart
+  = ElfHeaderPart
+  | ProgramHeadersPart
+  | InterpreterPart
+  | DynamicTablePart
+  deriving (Eq, Show, Generic, Binary)
 
 data ElfError
   = NotElf
   | UnsupportedClass Int      -- ^ EI_CLASS; only 2 (64-bit) is supported
   | UnsupportedByteOrder Int  -- ^ EI_DATA; only 1 (little-endian) is supported
-  | Truncated String          -- ^ which part ends before its declared size
-  | UnsupportedProgramHeaders String
+  | Truncated ElfPart         -- ^ it ends before its declared size, or beyond the file
+  | TooManyProgramHeaders     -- ^ e_phnum is PN_XNUM: the count is elsewhere; no program has that many
+  | ProgramHeaderTooSmall Int -- ^ e_phentsize, below the size of an ELF64 program header
   | NoDynamicTerminator       -- ^ a dynamic table without DT_NULL
-  | ElfIOError String
+  | ElfIOError String         -- ^ the operating system's message
   deriving (Eq, Show, Generic, Binary)
 
 -- | A part of the file: offset and size in bytes.
@@ -70,6 +86,14 @@ data ElfInfo = ElfInfo
   }
   deriving (Eq, Show)
 
+-- | Where the program headers are, from the file header.
+data ProgramHeaderTable = ProgramHeaderTable
+  { tableOffset :: Word64
+  , entrySize   :: Int
+  , entryCount  :: Int
+  }
+  deriving (Eq, Show)
+
 data ProgramHeader = ProgramHeader
   { pType   :: Word32
   , pOffset :: Word64
@@ -79,6 +103,14 @@ data ProgramHeader = ProgramHeader
 -- | Bytes of the ELF64 file header.
 elfHeaderSize :: Int
 elfHeaderSize = 64
+
+-- | Bytes of an ELF64 program header.
+programHeaderSize :: Int
+programHeaderSize = 56
+
+-- | @e_phnum@ when the count doesn't fit in the file header.
+pnXNum :: Int
+pnXNum = 0xffff
 
 ptDynamic, ptInterp :: Word32
 ptDynamic = 2
@@ -108,33 +140,30 @@ word32 i = fmap fromIntegral . word 4 i
 word64 :: Int -> ByteString -> Maybe Word64
 word64 = word 8
 
--- | From the first 'elfHeaderSize' bytes: where the program headers are, as
--- (offset, entry size, count).
-parseElfHeader :: ByteString -> Either ElfError (Word64, Int, Int)
+-- | From the first 'elfHeaderSize' bytes: where the program headers are.
+parseElfHeader :: ByteString -> Either ElfError ProgramHeaderTable
 parseElfHeader bs = do
   unless (BS.take 4 bs == BS.pack [0x7f, 0x45, 0x4c, 0x46]) $ Left NotElf
-  when (BS.length bs < elfHeaderSize) $ Left (Truncated "ELF header")
+  when (BS.length bs < elfHeaderSize) $ Left (Truncated ElfHeaderPart)
   let byteAt i = fromIntegral (BS.index bs i) :: Int
   unless (byteAt 4 == 2) $ Left (UnsupportedClass (byteAt 4))
   unless (byteAt 5 == 1) $ Left (UnsupportedByteOrder (byteAt 5))
-  maybe (Left (Truncated "ELF header")) Right $ do
+  table <- maybe (Left (Truncated ElfHeaderPart)) Right $ do
     phoff <- word64 0x20 bs
     phentsize <- word16 0x36 bs
     phnum <- word16 0x38 bs
-    pure (phoff, fromIntegral phentsize, fromIntegral phnum)
+    pure $ ProgramHeaderTable phoff (fromIntegral phentsize) (fromIntegral phnum)
+  when (table.entryCount == pnXNum) $ Left TooManyProgramHeaders
+  when (table.entryCount > 0 && table.entrySize < programHeaderSize) $
+    Left (ProgramHeaderTooSmall table.entrySize)
+  pure table
 
--- | The program headers, from @count@ entries of @entrySize@ bytes.
-parseProgramHeaders :: Int -> Int -> ByteString -> Either ElfError [ProgramHeader]
-parseProgramHeaders entrySize count bs = do
-  -- 0xffff (PN_XNUM) means the count is elsewhere; no program has that many.
-  when (count == 0xffff) $ Left (UnsupportedProgramHeaders "PN_XNUM")
-  when (count > 0 && entrySize < 56) $
-    Left (UnsupportedProgramHeaders ("entry size " <> show entrySize))
-  when (BS.length bs < entrySize * count) $ Left (Truncated "program headers")
-  traverse header [0 .. count - 1]
+-- | The program headers, from the bytes of their table.
+parseProgramHeaders :: ProgramHeaderTable -> ByteString -> Either ElfError [ProgramHeader]
+parseProgramHeaders table bs = traverse header [0 .. table.entryCount - 1]
   where
-    header k = maybe (Left (Truncated "program headers")) Right $ do
-      let base = k * entrySize
+    header k = maybe (Left (Truncated ProgramHeadersPart)) Right $ do
+      let base = k * table.entrySize
       ProgramHeader <$> word32 base bs <*> word64 (base + 8) bs <*> word64 (base + 32) bs
 
 -- | The file region of the first segment of the given type.
@@ -143,50 +172,66 @@ segment t headers = case [h | h <- headers, h.pType == t] of
   h : _ -> Just (Region h.pOffset h.pFileSz)
   []    -> Nothing
 
--- | Entries of a dynamic table, as (tag, value), up to and without the first
--- @DT_NULL@. 'Nothing' if there is no @DT_NULL@ in the bytes.
-dynamicEntries :: ByteString -> Maybe [(Word64, Word64)]
+-- | An entry of a dynamic table.
+data DynamicEntry = DynamicEntry
+  { tag   :: Word64
+  , value :: Word64
+  }
+  deriving (Eq, Show)
+
+-- | Entries of a dynamic table, up to and without the first @DT_NULL@.
+-- 'Nothing' if there is no @DT_NULL@ in the bytes.
+dynamicEntries :: ByteString -> Maybe [DynamicEntry]
 dynamicEntries bs = go 0
   where
     go i = do
       tag <- word64 i bs
       val <- word64 (i + 8) bs
-      if tag == dtNull then pure [] else ((tag, val) :) <$> go (i + dynEntrySize)
+      if tag == dtNull then pure [] else (DynamicEntry tag val :) <$> go (i + dynEntrySize)
 
--- | The dynamic table without its @DT_RPATH@ and @DT_RUNPATH@ entries, and the
--- number removed. Same length as the input; bytes from the first @DT_NULL@ on
--- are unchanged.
-withoutRunPaths :: ByteString -> Either ElfError (ByteString, Int)
+-- | A dynamic table after 'withoutRunPaths'.
+data WithoutRunPaths = WithoutRunPaths
+  { table   :: ByteString
+  , removed :: Int  -- ^ the entries removed
+  }
+  deriving (Eq, Show)
+
+-- | The dynamic table without its @DT_RPATH@ and @DT_RUNPATH@ entries. Same
+-- length as the input; bytes from the first @DT_NULL@ on are unchanged.
+withoutRunPaths :: ByteString -> Either ElfError WithoutRunPaths
 withoutRunPaths bs = do
   entries <- maybe (Left NoDynamicTerminator) Right (dynamicEntries bs)
   let
-    isRunPath (tag, _) = tag == dtRpath || tag == dtRunpath
+    isRunPath entry = entry.tag == dtRpath || entry.tag == dtRunpath
     kept = filter (not . isRunPath) entries
-    removed = length entries - length kept
+    removedCount = length entries - length kept
     prefixLength = length entries * dynEntrySize
-    encoded = BS.concat [le64 tag <> le64 val | (tag, val) <- kept]
-    zeros = BS.replicate (removed * dynEntrySize) 0
-  pure (encoded <> zeros <> BS.drop prefixLength bs, removed)
+    encoded = BS.concat [le64 entry.tag <> le64 entry.value | entry <- kept]
+    zeros = BS.replicate (removedCount * dynEntrySize) 0
+  pure $ WithoutRunPaths (encoded <> zeros <> BS.drop prefixLength bs) removedCount
 
 le64 :: Word64 -> ByteString
 le64 x = BS.pack [fromIntegral (x `shiftR` (8 * k)) | k <- [0 .. 7]]
 
--- | Read a file's interpreter and dynamic table location.
+-- | Read a file's interpreter and dynamic table location. Declared sizes are
+-- checked against the file before anything is read.
 readElfInfo :: OsPath -> IO (Either ElfError ElfInfo)
-readElfInfo path = catchIO $ withBinaryFile path ReadMode $ \h -> do
-  header <- BS.hGet h elfHeaderSize
-  case parseElfHeader header of
-    Left err -> pure (Left err)
-    Right (phoff, entrySize, count) -> do
-      bytes <- readRegion h (Region phoff (fromIntegral (entrySize * count)))
-      case parseProgramHeaders entrySize count bytes of
-        Left err -> pure (Left err)
-        Right headers -> do
-          interp <- traverse (readRegion h) (segment ptInterp headers)
-          pure $ Right ElfInfo
-            { interpreter = BS8.takeWhile (/= '\0') <$> interp
-            , dynamic = segment ptDynamic headers
-            }
+readElfInfo path = catchIO $ withBinaryFile path ReadMode $ \h -> runExceptT $ do
+  header <- liftIO $ BS.hGet h elfHeaderSize
+  table <- ExceptT $ pure $ parseElfHeader header
+  let tableRegion = Region table.tableOffset (fromIntegral (table.entrySize * table.entryCount))
+  bytes <- readRegion h ProgramHeadersPart tableRegion
+  headers <- ExceptT $ pure $ parseProgramHeaders table bytes
+  interp <- traverse (readRegion h InterpreterPart) (segment ptInterp headers)
+  interpreterPath <- traverse terminated interp
+  pure ElfInfo
+    { interpreter = interpreterPath
+    , dynamic = segment ptDynamic headers
+    }
+  where
+    terminated bytes = case BS8.elemIndex '\0' bytes of
+      Just end -> pure (BS.take end bytes)
+      Nothing  -> throwError (Truncated InterpreterPart)
 
 -- | Remove @RPATH@ and @RUNPATH@ from the file in place. Returns how many
 -- entries were removed; the file is not written if there are none.
@@ -197,22 +242,25 @@ removeRunPaths path = do
     Left err -> pure (Left err)
     Right ElfInfo { dynamic = Nothing } -> pure (Right 0)
     Right ElfInfo { dynamic = Just region } -> catchIO $
-      withBinaryFile path ReadWriteMode $ \h -> do
-        table <- readRegion h region
-        if fromIntegral (BS.length table) < region.size
-          then pure (Left (Truncated "dynamic table"))
-          else case withoutRunPaths table of
-            Left err -> pure (Left err)
-            Right (_, 0) -> pure (Right 0)
-            Right (table', n) -> do
-              hSeek h AbsoluteSeek (fromIntegral region.offset)
-              BS.hPut h table'
-              pure (Right n)
+      withBinaryFile path ReadWriteMode $ \h -> runExceptT $ do
+        table <- readRegion h DynamicTablePart region
+        edited <- ExceptT $ pure $ withoutRunPaths table
+        when (edited.removed > 0) $ liftIO $ do
+          hSeek h AbsoluteSeek (toInteger region.offset)
+          BS.hPut h edited.table
+        pure edited.removed
 
-readRegion :: Handle -> Region -> IO ByteString
-readRegion h r = do
-  hSeek h AbsoluteSeek (fromIntegral r.offset)
-  BS.hGet h (fromIntegral r.size)
+-- | The bytes of a region, if the file has all of them. A declared size is
+-- never passed to the allocator unchecked.
+readRegion :: Handle -> ElfPart -> Region -> ExceptT ElfError IO ByteString
+readRegion h part r = do
+  size <- liftIO $ hFileSize h
+  when (toInteger r.offset + toInteger r.size > size) $ throwError (Truncated part)
+  bytes <- liftIO $ do
+    hSeek h AbsoluteSeek (toInteger r.offset)
+    BS.hGet h (fromIntegral r.size)
+  when (toInteger (BS.length bytes) < toInteger r.size) $ throwError (Truncated part)
+  pure bytes
 
 catchIO :: IO (Either ElfError a) -> IO (Either ElfError a)
 catchIO act = try act >>= \case
