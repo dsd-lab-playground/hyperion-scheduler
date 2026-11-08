@@ -17,9 +17,13 @@ import Hyperion.OsString                     (fromString, toString)
 import Hyperion.Scheduler.TaskLaunch.Environment (StagedDirectories (..))
 import Hyperion.Scheduler.TaskLaunch.Staging
 import Hyperion.Util                         (myExecutable)
+import Data.List                             (isPrefixOf)
+import Data.Time.Clock                       (getCurrentTime)
 import System.Directory                      (copyFile, createDirectory,
                                               getTemporaryDirectory,
-                                              removeDirectoryRecursive)
+                                              listDirectory,
+                                              removeDirectoryRecursive,
+                                              setModificationTime)
 import System.Posix.Process                  (getProcessID)
 
 expect :: String -> Bool -> IO ()
@@ -125,6 +129,16 @@ runTest = do
               again <- stagePrograms staging [shared] exe
               expect "staging again reuses the folder" $
                 either (const False) (\s -> s.summary == staged.summary) again
+              keyFiles <- filter ("by-stat-" `isPrefixOf`) <$> listDirectory (toString (osDir </> "stage"))
+              expect "a key file names the folder staged from these sources" $ length keyFiles == 1
+              -- A newer modification time changes the key: the sources are hashed
+              -- again, and their contents give the same folder.
+              now <- getCurrentTime
+              setModificationTime (toString (shared </> fromString name)) now
+              touched <- stagePrograms staging [shared] exe
+              keyFiles' <- filter ("by-stat-" `isPrefixOf`) <$> listDirectory (toString (osDir </> "stage"))
+              expect "a touched source is hashed again and gives the same folder" $
+                either (const False) (\s -> s.summary == staged.summary) touched && length keyFiles' == 2
               BS.appendFile (toString (libDir </> fromString name)) "x"
               tampered <- stagePrograms staging [shared] exe
               expect "a changed staged file is an error" $ case tampered of

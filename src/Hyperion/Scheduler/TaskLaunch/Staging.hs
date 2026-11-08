@@ -78,11 +78,13 @@ import Hyperion.Scheduler.TaskLaunch.Elf (ElfError (..), ElfInfo (..),
 import Hyperion.Scheduler.TaskLaunch.Environment (StagedDirectories (..))
 import System.Directory.OsPath (copyFile, createDirectoryIfMissing,
                                 doesDirectoryExist, doesFileExist,
-                                getPermissions, removePathForcibly,
-                                renameDirectory, setOwnerWritable,
-                                setPermissions)
+                                getFileSize, getPermissions,
+                                removePathForcibly, renameDirectory,
+                                renameFile, setOwnerWritable, setPermissions)
 import System.Exit            (ExitCode (..))
 import System.File.OsPath     qualified as File
+import System.Posix.Files     (deviceID, fileID, fileSize, getFileStatus,
+                               modificationTimeHiRes)
 import System.Posix.Process   (getProcessID)
 import System.Process         (CreateProcess (..), proc,
                                readCreateProcessWithExitCode)
@@ -297,10 +299,11 @@ data StagedPrograms = StagedPrograms
   , expected         :: Map ProgramName ([OsPath], Map SoName Location)
   }
 
+-- | A program as resolved: its library locations, and (once hashed) its
+-- source's sha256.
 data Planned = Planned
   { name       :: ProgramName
   , prog       :: Program
-  , sourceHash :: Sha256
   , resolution :: Resolution
   , locations  :: Map SoName Location
   }
@@ -310,6 +313,13 @@ data Planned = Planned
 -- manifest. The reference library path must be concrete ('LibraryPath').
 -- Doesn't run the check: see 'checkStaged', which needs the task
 -- environment's library path.
+--
+-- Supervisors start again for every 'Hyperion.Scheduler.RunTasks.runTasks',
+-- so staging is cheap when nothing changed: a file @by-stat-\<key\>@ names the
+-- folder staged from sources with the same paths, sizes, modification times
+-- and inodes, and then no source is read; the staged files' sizes are
+-- checked. Otherwise every source is hashed, and the staged files' sha256s
+-- are checked.
 stagePrograms :: Staging -> [OsPath] -> OsPath -> IO (Either StagingError StagedPrograms)
 stagePrograms staging referencePath workerExe = runExceptT $ do
   let
@@ -320,12 +330,32 @@ stagePrograms staging referencePath workerExe = runExceptT $ do
   planned <- forM (zip names allPrograms) $ \(n, p) -> do
     exists <- liftIO $ doesFileExist p.executable
     unless exists $ throwError (NotFound p.executable)
-    resolution <- resolve n p.executable (p.libraryPathPrefix <> referencePath)
-    h <- sha256 p.executable
+    res <- resolve n p.executable (p.libraryPathPrefix <> referencePath)
     pure Planned
-      { name = n, prog = p, sourceHash = h, resolution = resolution
-      , locations = classify staging.systemLibraryDirs p resolution
+      { name = n, prog = p, resolution = res
+      , locations = classify staging.systemLibraryDirs p res
       }
+  key <- statKey planned
+  let Sha256 keyHex = key
+      keyPath = staging.directory </> OsString.fromString ("by-stat-" <> take 32 keyHex)
+  cached <- liftIO $ readCachedRoot staging.directory keyPath
+  reused <- case cached of
+    Just root -> do
+      sizesOk <- stagedSizesMatch root
+      if sizesOk then Just <$> fromStagedRoot planned workerExe root else pure Nothing
+    Nothing -> pure Nothing
+  case reused of
+    Just staged -> pure staged
+    Nothing -> do
+      staged <- stageFromSources staging planned workerExe
+      ioError' $ writeCachedRoot keyPath staged.summary.root
+      pure staged
+
+-- | Hash every source, write the manifest, and build the folder unless it
+-- exists; check the staged files' sha256s either way.
+stageFromSources :: Staging -> [Planned] -> OsPath -> ExceptT StagingError IO StagedPrograms
+stageFromSources staging planned workerExe = do
+  sourceHashes <- forM planned $ \pl -> (,) pl.name <$> sha256 pl.prog.executable
   wanted <- fmap concat $ forM planned $ \pl ->
     forM (Map.toList (stagedCopies pl)) $ \(so, src) -> do
       h <- sha256 src
@@ -333,30 +363,78 @@ stagePrograms staging referencePath workerExe = runExceptT $ do
   copies <- either (throwError . LibraryConflicts) pure $
     libraryCopies (Map.unionsWith (<>) wanted)
   let
-    manifest = renderManifest planned copies
-    hash = sha256String manifest
-    Sha256 hex = hash
+    manifest = renderManifest planned (Map.fromList sourceHashes) copies
     root = staging.directory </> OsString.fromString (take 32 hex)
-    binDir = root </> "bin"
-    libDir = root </> "lib"
-    staged = StagedPrograms
-      { summary = StagingSummary
-          { manifestHash = hash, root = root
-          , programNames = names, copiedLibraries = Map.size copies }
-      , directories = StagedDirectories binDir libDir
-      , workerExecutable = binDir </> takeFileName workerExe
-      , expected = Map.fromList
-          [ (pl.name, (pl.prog.libraryPathPrefix, pl.locations)) | pl <- planned ]
-      }
+      where Sha256 hex = sha256String manifest
   done <- liftIO $ doesDirectoryExist root
   unless done $ build staging.directory root manifest
-    [ (src, binDir </> takeFileName src) | pl <- planned, let src = pl.prog.executable ]
-    [ (src, libDir </> OsString.fromString so) | (SoName so, (src, _)) <- Map.toList copies ]
+    [ (src, root </> "bin" </> takeFileName src) | pl <- planned, let src = pl.prog.executable ]
+    [ (src, root </> "lib" </> OsString.fromString so) | (SoName so, (src, _)) <- Map.toList copies ]
   verifyStagedFiles root
-  pure staged
-  where
-    stagedCopies pl = Map.restrictKeys pl.resolution $
-      Map.keysSet (Map.filter (== StagedCopy) pl.locations)
+  fromStagedRoot planned workerExe root
+
+-- | The staged set in @root@, from its manifest.
+fromStagedRoot :: [Planned] -> OsPath -> OsPath -> ExceptT StagingError IO StagedPrograms
+fromStagedRoot planned workerExe root = do
+  manifest <- ioError' $ fromUtf8 . BL.fromStrict <$> File.readFile' (root </> manifestName)
+  let
+    binDir = root </> "bin"
+    libDir = root </> "lib"
+  pure StagedPrograms
+    { summary = StagingSummary
+        { manifestHash = sha256String manifest
+        , root = root
+        , programNames = map (.name) planned
+        , copiedLibraries = length [ () | l <- lines manifest, "library " `isPrefixOf` l ]
+        }
+    , directories = StagedDirectories binDir libDir
+    , workerExecutable = binDir </> takeFileName workerExe
+    , expected = Map.fromList
+        [ (pl.name, (pl.prog.libraryPathPrefix, pl.locations)) | pl <- planned ]
+    }
+
+stagedCopies :: Planned -> Resolution
+stagedCopies pl = Map.restrictKeys pl.resolution $
+  Map.keysSet (Map.filter (== StagedCopy) pl.locations)
+
+-- | A key of the sources' state: each program's and copied library's path,
+-- size, modification time, device and inode, and where each library is
+-- loaded from. Reads no file contents.
+statKey :: [Planned] -> ExceptT StagingError IO Sha256
+statKey planned = do
+  let
+    sources = Set.toList $ Set.fromList $
+      [ pl.prog.executable | pl <- planned ] <> concatMap (Map.elems . stagedCopies) planned
+  stats <- forM sources $ \src -> ioError' $ do
+    st <- getFileStatus (OsString.toString src)
+    pure $ unwords
+      [ "source", OsString.toString src, show (fileSize st)
+      , show (modificationTimeHiRes st), show (deviceID st), show (fileID st) ]
+  let locations =
+        [ unwords ["location", n, so, show l]
+        | pl <- planned, let ProgramName pn = pl.name, let n = OsString.toString pn
+        , (SoName so, l) <- Map.toList pl.locations ]
+  pure $ sha256String $ unlines $ "hyperion-scheduler stat key v1" : sort (stats <> locations)
+
+-- | The staged folder a key file names, if both exist.
+readCachedRoot :: OsPath -> OsPath -> IO (Maybe OsPath)
+readCachedRoot dir keyPath = do
+  r <- try (File.readFile' keyPath)
+  case r of
+    Left (_ :: IOException) -> pure Nothing
+    Right bytes -> do
+      let rootName = takeWhile (/= '\n') (fromUtf8 (BL.fromStrict bytes))
+          root = dir </> OsString.fromString rootName
+      ok <- doesFileExist (root </> manifestName)
+      pure $ if length rootName == 32 && ok then Just root else Nothing
+
+-- | Write a key file naming the staged folder, atomically.
+writeCachedRoot :: OsPath -> OsPath -> IO ()
+writeCachedRoot keyPath root = do
+  pid <- getProcessID
+  let tmp = keyPath <> OsString.fromString (".tmp-" <> show pid)
+  File.writeFile tmp (utf8 (OsString.toString (takeFileName root) <> "\n"))
+  renameFile tmp keyPath
 
 -- | Run the loader on each staged program, with its prefix and the given
 -- library path (the task environment's @LD_LIBRARY_PATH@, which starts with
@@ -417,10 +495,11 @@ fromUtf8 :: BL.ByteString -> String
 fromUtf8 = TL.unpack . TLE.decodeUtf8
 
 -- | One line per program and library, sorted: the identity of a staged set.
-renderManifest :: [Planned] -> LibraryCopies -> String
-renderManifest planned copies = unlines $ "hyperion-scheduler staged programs v1" : sort (concat
+renderManifest :: [Planned] -> Map ProgramName Sha256 -> LibraryCopies -> String
+renderManifest planned hashes copies = unlines $ "hyperion-scheduler staged programs v1" : sort (concat
   [ [ unwords ["program", showPath n, h, OsString.toString pl.prog.executable]
-    | pl <- planned, let ProgramName n = pl.name, let Sha256 h = pl.sourceHash ]
+    | pl <- planned, let ProgramName n = pl.name
+    , Just (Sha256 h) <- [Map.lookup pl.name hashes] ]
   , [ unwords ["library", so, h, OsString.toString src]
     | (SoName so, (src, Sha256 h)) <- Map.toList copies ]
   , [ unwords ["keeps", showPath n, so, OsString.toString p]
@@ -431,8 +510,9 @@ renderManifest planned copies = unlines $ "hyperion-scheduler staged programs v1
   ])
   where showPath = OsString.toString
 
-stagedListName :: OsPath
+stagedListName, manifestName :: OsPath
 stagedListName = "STAGED"
+manifestName = "MANIFEST"
 
 -- | Copy the files into a temporary folder next to @root@, remove their
 -- @RPATH@s, write the manifest and the staged files' hashes, and rename the
@@ -453,11 +533,13 @@ build parent root manifest bins libs = do
       setPermissions dst' (setOwnerWritable True perms)
     isElf <- (/= Nothing) <$> elfInfo dst'
     when isElf $ void $ withExceptT (ElfFailed src) $ ExceptT $ removeRunPaths dst'
-    (,) (relativeTo root dst) <$> sha256 dst'
+    h <- sha256 dst'
+    size <- ioError' $ getFileSize dst'
+    pure (relativeTo root dst, h, size)
   ioError' $ do
-    File.writeFile (tmp </> "MANIFEST") (utf8 manifest)
+    File.writeFile (tmp </> manifestName) (utf8 manifest)
     File.writeFile (tmp </> stagedListName) $ utf8 $ unlines
-      [ h <> " " <> OsString.toString rel | (rel, Sha256 h) <- staged ]
+      [ h <> " " <> show size <> " " <> OsString.toString rel | (rel, Sha256 h, size) <- staged ]
   renamed <- liftIO $ try (renameDirectory tmp root)
   case renamed of
     Right () -> pure ()
@@ -470,16 +552,33 @@ build parent root manifest bins libs = do
 relativeTo :: OsPath -> OsPath -> OsPath
 relativeTo root p = foldr1 (</>) (drop (length (splitDirectories root)) (splitDirectories p))
 
+-- | The list of staged files written when staging: path, sha256, size.
+stagedList :: OsPath -> ExceptT StagingError IO [(OsPath, Sha256, Integer)]
+stagedList root = do
+  listing <- ioError' $ BL.fromStrict <$> File.readFile' (root </> stagedListName)
+  forM (lines (fromUtf8 listing)) $ \line -> case words' line of
+    Just (h, size, rel) | length h == 64 -> pure (root </> OsString.fromString rel, Sha256 h, size)
+    _ -> throwError (StagedFileChanged (root </> stagedListName))
+  where
+    words' line = case break (== ' ') line of
+      (h, ' ' : rest) -> case break (== ' ') rest of
+        (n, ' ' : rel) | [(size, "")] <- reads n -> Just (h, size, rel)
+        _ -> Nothing
+      _ -> Nothing
+
 -- | Check every staged file's sha256 against the list written when staging.
 verifyStagedFiles :: OsPath -> ExceptT StagingError IO ()
 verifyStagedFiles root = do
-  listing <- ioError' $ BL.fromStrict <$> File.readFile' (root </> stagedListName)
-  forM_ (lines (fromUtf8 listing)) $ \line -> case break (== ' ') line of
-    (h, ' ' : rel) | length h == 64 -> do
-      let path = root </> OsString.fromString rel
-      actual <- sha256 path
-      unless (actual == Sha256 h) $ throwError (StagedFileChanged path)
-    _ -> throwError (StagedFileChanged (root </> stagedListName))
+  files <- stagedList root
+  forM_ files $ \(path, h, _) -> do
+    actual <- sha256 path
+    unless (actual == h) $ throwError (StagedFileChanged path)
+
+-- | Whether every staged file still has the size written when staging.
+stagedSizesMatch :: OsPath -> ExceptT StagingError IO Bool
+stagedSizesMatch root = do
+  files <- stagedList root
+  and <$> forM files (\(path, _, size) -> ioError' $ (== size) <$> getFileSize path)
 
 ioError' :: IO a -> ExceptT StagingError IO a
 ioError' act = ExceptT $ try act >>= \case
