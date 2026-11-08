@@ -32,6 +32,7 @@ import GHC.Generics                             (Generic)
 import Hyperion.OsPath                          (OsPath)
 import Hyperion.OsString                        (fromString)
 import Hyperion.Scheduler.Config                (Config (..))
+import Hyperion.Scheduler.TaskLaunch (defaultTaskLaunch)
 import Hyperion.Scheduler.FilePath              (VirtualFilePath (..),
                                                  isUnderLocalStorage)
 import Hyperion.Scheduler.StatKey               (FileStatKey,
@@ -511,6 +512,7 @@ testNodeLocalInputs = do
       , nodeLocalStorageSize = 0
       , localStoragePath     = fromString "/local"
       , reportInterval       = 1
+      , taskLaunch           = defaultTaskLaunch
       }
     producer = testTask "P" [] [local]
     consumer = testTask "C" [local, q] []

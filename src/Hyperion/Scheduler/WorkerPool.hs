@@ -59,12 +59,17 @@ import Hyperion.Scheduler.ConcurrentQueue (ConcurrentQueue, flushQueue,
                                            newQueue, readQueue, writeQueue)
 import Hyperion.Scheduler.FilePath        (getAddr)
 import Hyperion.Scheduler.NodeSupervisor  (NodeSupervisor, runOnNodeSupervisor,
-                                           startNodeSupervisor,
+                                           startNodeSupervisors,
                                            stopNodeSupervisor)
 import Hyperion.Scheduler.ReusableWorker  (ReusableWorker (..),
                                            deleteReusableWorker,
                                            runOnReusableWorker,
                                            spawnRemoteReusableWorker)
+import Hyperion.Scheduler.TaskLaunch      (StagingSummary (..), TaskLaunch,
+                                           TaskLaunchError (..),
+                                           isDefaultTaskLaunch,
+                                           validateTaskLaunch,
+                                           withConcreteReferencePath)
 import Hyperion.Scheduler.Types           (Node (..))
 import Hyperion.Util                      (sanitizeFileString)
 import System.Environment                 (lookupEnv)
@@ -179,14 +184,13 @@ getLogPath logDir wId = logDir </> wId' <.> "log" where
   -- TODO: check that different nodes have different paths?
   wId' = sanitizeFileString $ workerCpuIdToString wId
 
-newNodeWorkerPool :: WorkerAddr -> Int -> OsPath -> Job NodeWorkerPool
-newNodeWorkerPool addr maxWorkers logDir = do
+nodeWorkerIds :: WorkerAddr -> Int -> [WorkerCpuId]
+nodeWorkerIds addr maxWorkers = map (WorkerCpuId addr) [0 .. maxWorkers - 1]
+
+newNodeWorkerPool :: WorkerAddr -> Int -> OsPath -> Maybe NodeSupervisor -> Job NodeWorkerPool
+newNodeWorkerPool addr maxWorkers logDir supervisor = do
   let
-    ids = map (WorkerCpuId addr) [0 .. maxWorkers - 1]
-  useSupervisor <- liftIO $ (/= Just "0") <$> lookupEnv nodeSupervisorsVar
-  supervisor <- if useSupervisor
-    then Just <$> startNodeSupervisor addr (map (getLogPath logDir) ids)
-    else pure Nothing
+    ids = nodeWorkerIds addr maxWorkers
   workerMap <- fmap Map.fromList $ forM ids $ \w -> do
     tWorker <- newTWorker w (getLogPath logDir w) supervisor
     return (w, tWorker)
@@ -221,23 +225,50 @@ data WorkerPool = WorkerPool
   , logDir  :: OsPath
   }
 
-newWorkerPool :: [Node] -> Job WorkerPool
-newWorkerPool nodes = do
+newWorkerPool :: TaskLaunch -> [Node] -> Job WorkerPool
+newWorkerPool launch nodes = do
   -- 'Log.getLogFile' is unset when logs go to stderr, e.g. under 'runJobLocal'.
   programLogDir <- asks ((.programLogDir) . jobProgramInfo)
   maybeLogFile <- Log.getLogFile
   let logDir = maybe (programLogDir </> "workers") dropExtension maybeLogFile
+  supervisors <- startSupervisors launch logDir nodes
   nodeMap <- fmap Map.fromList $
-    forM nodes $ \node -> do
-      pool <- newNodeWorkerPool node.address node.cpus logDir
+    forM (zip nodes supervisors) $ \(node, supervisor) -> do
+      pool <- newNodeWorkerPool node.address node.cpus logDir supervisor
       return (node.address, pool)
   return $ WorkerPool nodeMap logDir
 
-withWorkerPool :: [Node] -> (WorkerPool -> Job a) -> Job a
-withWorkerPool nodes go = bracket acquire release go' where
+-- | One supervisor per node, started all at once, or none if they are turned
+-- off. Checks the task launch configuration first, and that every node
+-- staged the same programs.
+startSupervisors :: TaskLaunch -> OsPath -> [Node] -> Job [Maybe NodeSupervisor]
+startSupervisors launch logDir nodes = do
+  useSupervisor <- liftIO $ (/= Just "0") <$> lookupEnv nodeSupervisorsVar
+  let errors = validateTaskLaunch launch
+        <> [ NeedsNodeSupervisors | not useSupervisor, not (isDefaultTaskLaunch launch) ]
+  when (not (null errors)) $
+    Log.throwError $ "Invalid task launch configuration: " <> show errors
+  if not useSupervisor
+    then pure (map (const Nothing) nodes)
+    else do
+      launch' <- liftIO $ withConcreteReferencePath launch
+      started <- startNodeSupervisors launch'
+        [ (node.address, map (getLogPath logDir) (nodeWorkerIds node.address node.cpus))
+        | node <- nodes ]
+      let hashes = Set.fromList [ s.manifestHash | (_, Just s) <- started ]
+      when (Set.size hashes > 1) $ Log.throwError $
+        "Nodes staged different programs: " <>
+        show [ (node.address, s) | (node, (_, Just s)) <- zip nodes started ]
+      case [ s | (_, Just s) <- started ] of
+        s : _ -> Log.info "Every node staged the same programs" s
+        []    -> pure ()
+      pure (map (Just . fst) started)
+
+withWorkerPool :: TaskLaunch -> [Node] -> (WorkerPool -> Job a) -> Job a
+withWorkerPool launch nodes go = bracket acquire release go' where
   acquire = do
     startTime <- liftIO getMonotonicTimeNSec
-    pool <- newWorkerPool nodes
+    pool <- newWorkerPool launch nodes
     return (startTime, pool)
 
   release :: (TimeNanoSec, WorkerPool) -> Job ()

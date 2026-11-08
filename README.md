@@ -25,6 +25,44 @@ on Expanse, i.e. 3–5 GB per node at 128 CPUs. Leave room for it when you set
 With `HYPERION_SCHEDULER_NODE_SUPERVISORS=0`, read by the master, the master
 launches each worker itself.
 
+## Task launch: environment and node-local executables
+
+`Config.taskLaunch` says how the supervisors launch workers. Every process a
+task starts (a script, an external program) inherits its worker's
+environment. The default, `defaultTaskLaunch`, is the behaviour from before:
+workers inherit the supervisor's environment and run the executable where it
+is. Both settings take effect once per node, when its supervisor starts; the
+master does nothing more per task.
+
+- `SetEnvironment env`: workers get an explicit `TaskEnvironment` instead
+  (`Hyperion.Scheduler.TaskLaunch.Environment`): `PATH` and `LD_LIBRARY_PATH`
+  as typed lists, thread counts for BLAS and OpenMP, other variables set or
+  inherited. `defaultTaskEnvironment` has `PATH=/usr/bin:/bin`, no
+  `LD_LIBRARY_PATH` and one BLAS and one OpenMP thread. Task scripts then
+  need no `module load`.
+- `NodeLocalExecutables staging`: each supervisor copies the worker
+  executable and the listed programs, with every library they load outside
+  the system folders, into `staging.directory` on node-local disk, removes
+  the copies' `RPATH`s, and checks with the loader that each copy loads the
+  libraries the original loaded. The folder is named by a hash of every
+  source file, so a second run in the same job reuses it, and the master
+  checks that all nodes staged the same files. Workers start from the copy,
+  with the staged `bin` and `lib` first in `PATH` and `LD_LIBRARY_PATH`, so a
+  task finds a staged program by its name.
+
+Why: on Expanse a process that starts while 31 others start too spends ~77
+ms in the kernel when `/cm/shared` (CephFS) folders are on its library path,
+whether from the module environment or from an `RPATH`, against 0.7 ms with
+node-local folders only; and OpenBLAS starts one thread per core in every
+worker unless told otherwise. A generation that starts several processes per
+task spent most of its time there (bootstrap-compute #343).
+
+Both need supervisors: with `HYPERION_SCHEDULER_NODE_SUPERVISORS=0` a
+non-default `taskLaunch` is an error at start. A path is node-local exactly
+when it is under `localStoragePath`; don't reach node-local files through a
+symbolic link on a network filesystem, since every `open` resolves the link
+there.
+
 ## Building
 
 ```sh

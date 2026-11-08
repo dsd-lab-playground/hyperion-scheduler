@@ -11,8 +11,8 @@
 --
 -- Three entry points:
 --
--- > hyperion-scheduler-test local  [--shift N] [--dim N] [--base-dir DIR] [--cpus N]
--- > hyperion-scheduler-test master [--shift N] [--dim N] [--base-dir DIR] <sbatch options>
+-- > hyperion-scheduler-test local  [--shift N] [--dim N] [--base-dir DIR] [--cpus N] [launch options]
+-- > hyperion-scheduler-test master [--shift N] [--dim N] [--base-dir DIR] [launch options] <sbatch options>
 -- > hyperion-scheduler-test worker ...   -- launched by hyperion, not by hand
 --
 -- @local@ runs everything in this process with no SLURM and no cluster
@@ -33,7 +33,7 @@ import Hyperion                                hiding (opts)
 import Hyperion.Log                            qualified as Log
 import Hyperion.OsPath                         (OsPath, (</>))
 import Hyperion.OsString                       (fromString, showOs)
-import Hyperion.Scheduler.Test.Config          (Site)
+import Hyperion.Scheduler.Test.Config          (LaunchOptions (..), Site)
 import Hyperion.Scheduler.Test.Config          qualified as TestConfig
 import Hyperion.Scheduler.Test.LinearTransform (CyclicShiftProblem (..),
                                                 linearTransformJob)
@@ -43,7 +43,7 @@ import Options.Applicative                     (Parser, ParserInfo, auto,
                                                 execParser, fullDesc, help,
                                                 helper, info, long, metavar,
                                                 option, optional, progDesc, str,
-                                                value, (<**>))
+                                                switch, value, (<**>))
 import System.Console.Concurrent               (withConcurrentOutput)
 import System.Directory.OsPath                 (createDirectoryIfMissing,
                                                 makeAbsolute)
@@ -58,6 +58,7 @@ data ProblemOptions = ProblemOptions
   { shift   :: Int
   , dim     :: Int
   , baseDir :: Maybe OsPath
+  , launch  :: LaunchOptions
   } deriving (Show)
 
 problemOptsParser :: Parser ProblemOptions
@@ -68,7 +69,11 @@ problemOptsParser = do
     <> help "Input vector size"
   baseDir <- optional $ option (fromString <$> str) $ long "base-dir" <> metavar "DIR"
     <> help "Base directory for output files"
-  pure ProblemOptions{..}
+  nodeLocalExecutables <- switch $ long "node-local-executables"
+    <> help "Stage the executable on node-local disk and launch workers from the copy"
+  taskEnvironment <- switch $ long "task-environment"
+    <> help "Launch workers with the default task environment"
+  pure ProblemOptions{launch = LaunchOptions{..}, ..}
 
 toProblem :: ProblemOptions -> CyclicShiftProblem
 toProblem opts = MkCyclicShiftProblem { shift = opts.shift, dim = opts.dim }
@@ -126,6 +131,7 @@ runLocal opts = withConcurrentOutput $ do
       , programDataDir  = baseDir </> "data"
       }
     schedulerConfig = TestConfig.localSchedulerConfig (baseDir </> "node_local_storage")
+      (TestConfig.testTaskLaunch opts.problem.launch (baseDir </> "node_local_programs"))
   Log.info "Running locally" (baseDir, cpus)
   -- Worker processes that the scheduler's node supervisor launches inherit it.
   setEnv localWorkersEnvVar "1"
@@ -170,7 +176,7 @@ runOnCluster site = do
     clusterComputation opts = do
       baseDir <- liftIO $ maybe (TestConfig.getScratchDir site) makeAbsolute opts.problem.baseDir
       remoteEvalJob $ static linearTransformJob
-        `cAp` (static TestConfig.getSchedulerConfig `cAp` cPure site)
+        `cAp` (static TestConfig.getSchedulerConfig `cAp` cPure site `cAp` cPure opts.problem.launch)
         `cAp` cPure (workDir baseDir opts)
         `cAp` cPure (toProblem opts.problem)
 

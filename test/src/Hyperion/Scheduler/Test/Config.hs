@@ -22,6 +22,10 @@ import Hyperion                  (Dict (..), HostNameStrategy (..),
 import Hyperion.OsPath           (OsPath, (</>))
 import Hyperion.OsString         (fromString)
 import Hyperion.Scheduler.Config qualified as Scheduler
+import Hyperion.Scheduler.TaskLaunch (EnvironmentPolicy (..),
+                                      ExecutablePolicy (..), TaskLaunch (..),
+                                      defaultStaging, defaultTaskEnvironment,
+                                      defaultTaskLaunch)
 import Hyperion.Slurm            (SbatchOptions (..))
 import Hyperion.Slurm            qualified as Slurm
 import System.Environment        (getEnv)
@@ -108,8 +112,8 @@ getHyperionConfig site workDir sbatchOptions = (defaultHyperionConfig workDir)
 
 -- | Scheduler config for a compute node of @site@. Runs on the node, so it can
 -- read the SLURM environment to locate node-local scratch.
-getSchedulerConfig :: Site -> Job Scheduler.Config
-getSchedulerConfig = \case
+getSchedulerConfig :: Site -> LaunchOptions -> Job Scheduler.Config
+getSchedulerConfig site launchOpts = case site of
   Expanse -> do
     user <- liftIO $ getEnv "USER"
     slurmJobId <- liftIO $ getEnv "SLURM_JOB_ID"
@@ -119,6 +123,7 @@ getSchedulerConfig = \case
       , nodeLocalStorageSize = 900 * 1000 * 1000 * 1000
       , localStoragePath     = localStoragePath
       , reportInterval       = 10
+      , taskLaunch           = testTaskLaunch launchOpts (localStoragePath </> "programs")
       }
 
 -- * Local (no SLURM) configuration
@@ -126,10 +131,37 @@ getSchedulerConfig = \case
 -- | Scheduler config for a single local "node". @localStoragePath@ stands in
 -- for node-local scratch, so the file-service and cleanup logic is exercised
 -- locally too.
-localSchedulerConfig :: OsPath -> Scheduler.Config
-localSchedulerConfig localStoragePath = Scheduler.MkConfig
+localSchedulerConfig :: OsPath -> TaskLaunch -> Scheduler.Config
+localSchedulerConfig localStoragePath launch = Scheduler.MkConfig
   { nodeMemory           = 4 * 1024 * 1024 * 1024
   , nodeLocalStorageSize = 1024 * 1024 * 1024
   , localStoragePath     = localStoragePath
   , reportInterval       = 5
+  , taskLaunch           = launch
+  }
+
+-- * Task launch
+
+-- | Which non-default task launch settings the test uses.
+data LaunchOptions = LaunchOptions
+  { -- | Stage the test executable on node-local disk and launch workers from
+    -- the copy.
+    nodeLocalExecutables :: Bool
+    -- | Launch workers with 'defaultTaskEnvironment'.
+  , taskEnvironment      :: Bool
+  }
+  deriving (Eq, Show, Generic, Binary)
+
+instance Static (Binary LaunchOptions) where
+  closureDict = static Dict
+
+-- | The task launch for the options, staging in the given folder.
+testTaskLaunch :: LaunchOptions -> OsPath -> TaskLaunch
+testTaskLaunch opts stagingDir = defaultTaskLaunch
+  { environment = if opts.taskEnvironment
+      then SetEnvironment defaultTaskEnvironment
+      else InheritEnvironment
+  , executables = if opts.nodeLocalExecutables
+      then NodeLocalExecutables (defaultStaging stagingDir)
+      else SharedExecutables
   }

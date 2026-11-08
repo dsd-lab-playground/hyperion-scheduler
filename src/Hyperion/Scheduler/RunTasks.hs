@@ -577,7 +577,7 @@ runTaskMap config taskMap = do
   either Log.throw pure $ validateNodeLocalInputs config taskMap
   nodes <- getJobNodes config
   reportBeforeRun config nodes taskMap
-  withFileService config nodes $ \fileService -> withWorkerPool nodes $ \workerPool -> do
+  withFileService config nodes $ \fileService -> withWorkerPool config.taskLaunch nodes $ \workerPool -> do
       let
         getTaskPriority = taskPriority $ mkTaskPriorityHelper nodes taskGraph
         -- TODO: check disk space when computing initialAllocs
