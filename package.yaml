@@ -30,6 +30,7 @@ library:
   - bytestring
   - concurrency
   - containers
+  - crypton
   - deepseq
   - directory
   - disk-free-space
@@ -98,6 +99,7 @@ tests:
     - base
     - binary
     - bootstrap-build
+    - bytestring
     - containers
     - directory
     - exceptions
@@ -108,4 +110,5 @@ tests:
     - store
     - text
     - time
+    - unix
     ghc-options: -threaded

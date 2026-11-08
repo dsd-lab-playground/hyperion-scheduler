@@ -50,6 +50,10 @@ library
       Hyperion.Scheduler.Task.WrappedTask
       Hyperion.Scheduler.TaskFiles
       Hyperion.Scheduler.TaskGraph
+      Hyperion.Scheduler.TaskLaunch
+      Hyperion.Scheduler.TaskLaunch.Elf
+      Hyperion.Scheduler.TaskLaunch.Environment
+      Hyperion.Scheduler.TaskLaunch.Staging
       Hyperion.Scheduler.TPrioQueue
       Hyperion.Scheduler.Types
       Hyperion.Scheduler.Util
@@ -69,6 +73,7 @@ library
     , bytestring
     , concurrency
     , containers
+    , crypton
     , deepseq
     , directory
     , disk-free-space
@@ -140,10 +145,13 @@ test-suite hyperion-scheduler-unit-test
   other-modules:
       Hyperion.Scheduler.Test.ComputeValueTest
       Hyperion.Scheduler.Test.Counted
+      Hyperion.Scheduler.Test.ElfTest
       Hyperion.Scheduler.Test.EstimateTest
       Hyperion.Scheduler.Test.InputSummaryTest
+      Hyperion.Scheduler.Test.StagingTest
       Hyperion.Scheduler.Test.StorageStrategyTest
       Hyperion.Scheduler.Test.StoreFileTest
+      Hyperion.Scheduler.Test.TaskEnvironmentTest
       Hyperion.Scheduler.Test.TaskFilesTest
       Hyperion.Scheduler.Test.TaskMapTest
       Hyperion.Scheduler.Test.WriteFileAtomicTest
@@ -156,6 +164,7 @@ test-suite hyperion-scheduler-unit-test
     , base
     , binary
     , bootstrap-build
+    , bytestring
     , containers
     , directory
     , exceptions
@@ -166,4 +175,5 @@ test-suite hyperion-scheduler-unit-test
     , store
     , text
     , time
+    , unix
   default-language: GHC2021
